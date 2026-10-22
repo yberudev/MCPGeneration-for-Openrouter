@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "mcp-generation-openrouter": {
+      "command": "node",
+      "args": ["/absolute/path/to/MCPGeneration-for-Openrouter/dist/index.js"],
+      "env": {
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+        "YBERU_PROJECT_ROOT": "${CLAUDE_PROJECT_DIR:-.}",
+        "MAX_COST_PER_REQUEST_USD": "5",
+        "MAX_TOTAL_SPEND_USD": "20"
+      }
+    }
+  }
+}
