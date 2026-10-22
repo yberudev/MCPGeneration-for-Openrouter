@@ -11,6 +11,8 @@
 | `UNKNOWN_SPEND_REQUIRES_RECONCILIATION` | Houve um POST com resultado/custo incerto. Verifique OpenRouter e os registos locais antes de remover a reserva.                                                  |
 | `DUPLICATE_UNCERTAIN_REQUEST`           | O mesmo pedido está pendente ou teve resposta incerta. Reutilize o job existente ou reconcilie `requests.json`; não repita cegamente.                             |
 | `IMAGE_TO_VIDEO_UNSUPPORTED`            | O catálogo não publica `first_frame` para esse modelo. Escolha um modelo que publique o tipo de frame requerido.                                                  |
+| `VIDEO_AUDIO_REQUIRED`                  | HeyGen Video 1 sempre gera áudio. Omita `generate_audio`; para remover a faixa, faça pós-processamento separado com FFmpeg.                                       |
+| `UNSUPPORTED_VIDEO_AUDIO`               | O modelo não publica controlo configurável de áudio. Omita `generate_audio`; o valor `false` do catálogo não garante vídeo silencioso.                            |
 | `UNSAFE_IMAGE_URL`                      | Para `input_image_url`, use HTTPS sem IP literal, hostname local, credenciais ou fragmento.                                                                       |
 | `PATH_NOT_ALLOWED`                      | Use um caminho sob `YBERU_PROJECT_ROOT`/`CLAUDE_PROJECT_DIR` ou acrescente a raiz a `YBERU_ALLOWED_ROOTS`.                                                        |
 | `SYMLINK_NOT_ALLOWED`                   | O caminho de saída passa por symlink. Escolha um diretório normal dentro de uma raiz autorizada.                                                                  |

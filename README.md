@@ -33,7 +33,7 @@ O servidor usa MCP v2 e transporte `stdio`. Não inclui uma interface web nem ex
 
 Os modelos padrão são `google/gemini-3.1-flash-lite-image` e `heygen/heygen-video-1`. O catálogo é consultado em tempo de execução; os identificadores e capacidades podem mudar. `google/gemini-3.1-flash-image` também está disponível para ser escolhido explicitamente quando existir no catálogo.
 
-O servidor valida proporções, resoluções, durações, áudio, entrada de referência e quantidade de resultados contra os dados que o OpenRouter publica para cada modelo. Não tenta um endpoint de chat como fallback.
+O servidor valida proporções, resoluções, durações, áudio, entrada de referência e quantidade de resultados contra os dados que o OpenRouter publica para cada modelo. O campo de áudio é opcional: quando omitido, não é enviado. `list_models` separa áudio configurável, gerido pelo fornecedor e obrigatório. Não tenta um endpoint de chat como fallback.
 
 ## Requisitos
 
@@ -125,6 +125,8 @@ Nenhuma chave ou chamada de geração paga é necessária para iniciar o process
 `generate_video` envia `model`, `prompt` e parâmetros suportados; recebe um job assíncrono e persiste o ID. `get_video_status` consulta o mesmo ID e não cria outro job. O download usa `/videos/{id}/content`, autenticação OpenRouter e streaming; não usa URLs externos de resultado como links permanentes.
 
 `animate_image` envia a imagem local como `frame_images[0]` com `frame_type: "first_frame"`, desde que o modelo publique essa capacidade. O pedido local usa uma data URL; alguns fornecedores exigem uma imagem HTTPS pública e podem rejeitá-la. Nessa situação, passe `input_image_url` HTTPS de uma imagem publicamente acessível; o MCP não descarrega esse URL e não lhe envia a chave OpenRouter. URLs com IP literal, host local, credenciais ou fragmentos são recusados. O servidor não hospeda automaticamente uma imagem local na Internet.
+
+`generate_audio` distingue campo omitido, `true` e `false`: o campo omitido permanece fora do JSON enviado. HeyGen Video 1 sempre produz áudio; o catálogo publica `generate_audio: false`, mas esse valor não significa saída silenciosa e o endpoint rejeita `generate_audio: false`. O MCP recusa esse pedido localmente com `VIDEO_AUDIO_REQUIRED`. Modelos que anunciam controlo configurável preservam os booleans escolhidos. Para modelos sem esse controlo, o MCP não promete silêncio. O áudio gerado por HeyGen pode ser removido depois com FFmpeg (por exemplo, `ffmpeg -i input.mp4 -c:v copy -an output.mp4`); esse pós-processamento não faz parte da geração do MCP.
 
 `frame_images` fixa uma imagem num ponto específico do vídeo; `input_references` dá imagens para orientar a cena sem fixar o frame. O custo usa SKUs diferentes: para HeyGen Video, a consulta real de 22-10-2026 publica, a 480p, `$0.02/s` em `duration_seconds_480p`, `$0.07/s` em `reference_duration_seconds_480p` e `$0.04` por imagem em `reference_input_images`. Assim, cinco segundos a 480p estimam `$0.10` para texto ou primeiro frame e `$0.39` para uma imagem de referência. O custo real continua a ser o informado pelo OpenRouter após a geração. Este projeto gera ficheiros multimédia; não cria modelos 3D manipuláveis nem animações interativas.
 

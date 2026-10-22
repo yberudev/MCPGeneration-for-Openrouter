@@ -6,6 +6,7 @@ import type { CostGuard } from '../services/cost-guard.js';
 import type { ModelRegistry } from '../services/model-registry.js';
 import { safely } from './result.js';
 import { AppError } from '../utils/errors.js';
+import { resolveGenerateAudio, videoAudioCapability } from '../services/video-capabilities.js';
 
 interface CatalogDeps {
   config: AppConfig;
@@ -59,7 +60,7 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
                   sizes: model.supported_sizes ?? null,
                   durations_seconds: model.supported_durations ?? null,
                   frame_images: model.supported_frame_images ?? null,
-                  generate_audio: model.generate_audio ?? null,
+                  audio_policy: videoAudioCapability(model),
                   seed: model.seed ?? null,
                   passthrough_parameters: model.allowed_passthrough_parameters ?? null,
                 },
@@ -84,7 +85,7 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
         count: z.number().int().min(1).max(deps.config.maxImageVariations).default(1),
         frame_image_count: z.number().int().min(0).max(2).default(0),
         reference_image_count: z.number().int().min(0).max(20).default(0),
-        generate_audio: z.boolean().default(false),
+        generate_audio: z.boolean().optional(),
       }),
     },
     async (args) =>
@@ -190,8 +191,7 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
           (!model.supported_aspect_ratios || !model.supported_aspect_ratios.includes(args.aspect_ratio))
         )
           throw new AppError(`Proporção não publicada para ${model.id}.`, 'UNSUPPORTED_VIDEO_ASPECT_RATIO');
-        if (args.generate_audio && model.generate_audio !== true)
-          throw new AppError(`O catálogo não confirma áudio para ${model.id}.`, 'UNSUPPORTED_VIDEO_AUDIO');
+        const generateAudio = resolveGenerateAudio(model, args.generate_audio);
         const estimate = deps.costs.videoEstimate(model, {
           duration:
             args.duration ??
@@ -212,9 +212,14 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
           frameImageCount:
             args.operation === 'animate' ? Math.max(1, args.frame_image_count) : args.frame_image_count,
           inputReferenceCount: args.reference_image_count,
-          generateAudio: args.generate_audio,
+          ...(generateAudio !== undefined ? { generateAudio } : {}),
         });
-        return { success: true, ...estimate };
+        return {
+          success: true,
+          ...estimate,
+          audio_policy: videoAudioCapability(model),
+          audio_parameter: generateAudio === undefined ? 'omitted' : generateAudio,
+        };
       }),
   );
 

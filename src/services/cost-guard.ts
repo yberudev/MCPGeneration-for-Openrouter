@@ -3,6 +3,7 @@ import type { AppConfig } from '../config/env.js';
 import { AppError } from '../utils/errors.js';
 import type { ImageModel, VideoModel } from '../types/openrouter.js';
 import type { MetadataStore } from './metadata-store.js';
+import { videoAudioCapability } from './video-capabilities.js';
 
 export interface CostEstimate {
   status: 'estimated' | 'unknown';
@@ -122,7 +123,11 @@ export class CostGuard {
         'O catálogo não informa o custo das imagens de referência para este modelo.',
       );
     }
-    if (options.generateAudio && !Object.keys(sku).some((key) => key.toLowerCase().includes('audio'))) {
+    if (
+      options.generateAudio &&
+      videoAudioCapability(model).mode === 'configurable' &&
+      !Object.keys(sku).some((key) => key.toLowerCase().includes('audio'))
+    ) {
       return this.unknownVideo(model, options, 'O catálogo não separa eventual custo adicional de áudio.');
     }
     const estimate = (rate * duration + (referenceInputRate ?? 0) * inputReferenceCount) * count;
@@ -140,7 +145,7 @@ export class CostGuard {
         inputMode,
         frameImageCount,
         inputReferenceCount,
-        generateAudio: options.generateAudio ?? false,
+        generateAudio: options.generateAudio ?? null,
         pricePerSecondUsd: rate,
         referenceInputImageUsd: referenceInputRate ?? 0,
       },

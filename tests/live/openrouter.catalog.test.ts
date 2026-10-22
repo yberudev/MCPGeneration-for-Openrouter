@@ -75,6 +75,12 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
       const heygen = videoCatalog.models.find((model) => model.id === 'heygen/heygen-video-1');
       expect(heygen?.type).toBe('video');
       expect(heygen?.capabilities.frame_images).toContain('first_frame');
+      expect(heygen?.capabilities.audio_policy).toMatchObject({
+        mode: 'always_on',
+        configurable: false,
+        canDisable: false,
+        catalogValue: false,
+      });
       expect(heygen?.pricing).toMatchObject({
         duration_seconds_480p: '0.02',
         reference_duration_seconds_480p: '0.07',
@@ -144,6 +150,7 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
 
         const video = resultData<{
           dry_run: boolean;
+          audio_policy: { mode: string };
           configuration: Record<string, unknown>;
           estimate: { estimateUsd: number };
         }>(
@@ -159,17 +166,20 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
             },
           }),
         );
-        expect(video.configuration).toMatchObject({
+        expect(video.configuration).toEqual({
           model: 'heygen/heygen-video-1',
+          prompt: 'dry-run video validation only',
           duration: 5,
           resolution: '480p',
           aspect_ratio: '16:9',
-          generate_audio: false,
         });
+        expect(video.configuration.generate_audio).toBeUndefined();
+        expect(video.audio_policy.mode).toBe('always_on');
         expect(video.estimate.estimateUsd).toBe(0.1);
 
         const animated = resultData<{
           dry_run: boolean;
+          audio_policy: { mode: string };
           configuration: {
             frame_images: Array<{ type: string; frame_type: string; image_url: { url: string } }>;
           };
@@ -193,6 +203,9 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
           frame_type: 'first_frame',
           image_url: { url: expect.stringContaining('data URL image/png omitida') },
         });
+        expect(animated.configuration.generate_audio).toBeUndefined();
+        expect(JSON.stringify(animated.configuration)).not.toContain('base64');
+        expect(animated.audio_policy.mode).toBe('always_on');
         expect(animated.estimate.estimateUsd).toBe(0.1);
         expect(animated.estimate.parameters.inputMode).toBe('frame_images');
 

@@ -27,7 +27,7 @@ function imageCatalog() {
   };
 }
 
-function videoCatalog() {
+function videoCatalog(includeConfigurableAudio = false) {
   return {
     data: [
       {
@@ -35,7 +35,7 @@ function videoCatalog() {
         name: 'HeyGen Video',
         description: 'Mock video model',
         supported_resolutions: ['480p', '768p', '2K'],
-        supported_aspect_ratios: ['16:9', '9:16'],
+        supported_aspect_ratios: ['1:1', '16:9', '9:16'],
         supported_durations: [5, 10],
         supported_frame_images: ['first_frame'],
         generate_audio: false,
@@ -45,6 +45,24 @@ function videoCatalog() {
           reference_input_images: '0.04',
         },
       },
+      ...(includeConfigurableAudio
+        ? [
+            {
+              id: 'google/veo-3.1',
+              name: 'Veo 3.1',
+              description: 'Mock model with configurable audio',
+              supported_resolutions: ['480p'],
+              supported_aspect_ratios: ['16:9'],
+              supported_durations: [5],
+              supported_frame_images: ['first_frame'],
+              generate_audio: true,
+              pricing_skus: {
+                duration_seconds_480p: '0.02',
+                audio_generation: '0.01',
+              },
+            },
+          ]
+        : []),
     ],
   };
 }
@@ -124,6 +142,14 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
       expect(
         content.models.find((model) => model.id.includes('heygen'))?.capabilities.durations_seconds,
       ).toEqual([5, 10]);
+      expect(
+        content.models.find((model) => model.id.includes('heygen'))?.capabilities.audio_policy,
+      ).toMatchObject({
+        mode: 'always_on',
+        configurable: false,
+        canDisable: false,
+        catalogValue: false,
+      });
     });
   });
 
@@ -291,10 +317,12 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
 
   it('animates a local image through first_frame and persists no base64 in task metadata', async () => {
     let submittedBody: Record<string, unknown> | undefined;
+    let posts = 0;
     const fetchMock: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith('/videos/models')) return Response.json(videoCatalog());
       if (url.endsWith('/videos') && init?.method === 'POST') {
+        posts += 1;
         submittedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
         return Response.json({ id: 'animate-job-1', status: 'pending' }, { status: 202 });
       }
@@ -308,16 +336,222 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
         arguments: { prompt: 'The dragon waves', input_image_path: input, allow_paid: true },
       });
       expect(result.isError).not.toBe(true);
-      const job = result.structuredContent as { status: string; estimate: { estimateUsd: number } };
+      const job = result.structuredContent as {
+        job_id: string;
+        remote_job_id: string;
+        status: string;
+        estimate: { estimateUsd: number };
+        audio_policy: { mode: string };
+      };
       expect(job.status).toBe('pending');
       expect(job.estimate.estimateUsd).toBe(0.1);
+      expect(job.audio_policy.mode).toBe('always_on');
+      expect(submittedBody?.generate_audio).toBeUndefined();
       const frames = submittedBody?.frame_images as Array<{ frame_type: string; image_url: { url: string } }>;
       expect(frames[0]?.frame_type).toBe('first_frame');
       expect(frames[0]?.image_url.url).toContain('data:image/png;base64,');
       const stored = await readFile(join(dir, 'data', 'jobs.json'), 'utf8');
       expect(stored).not.toContain('data:image/png;base64,');
       expect(stored).toContain(input);
+      const jobs = JSON.parse(stored) as Array<{
+        id: string;
+        remoteId: string;
+        status: string;
+        config: Record<string, unknown>;
+      }>;
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]).toMatchObject({
+        id: job.job_id,
+        remoteId: job.remote_job_id,
+        status: 'pending',
+      });
+      expect(jobs[0]?.config.generate_audio).toBeUndefined();
+      expect(JSON.parse(await readFile(join(dir, 'data', 'requests.json'), 'utf8'))).toEqual([]);
+      expect(posts).toBe(1);
     });
+  });
+
+  it('rejects explicit HeyGen audio disable locally before reserving or posting', async () => {
+    let posts = 0;
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/videos/models')) return Response.json(videoCatalog());
+      if (url.endsWith('/videos') && init?.method === 'POST') {
+        posts += 1;
+        return Response.json({ id: 'unexpected' }, { status: 202 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+    await withMcp(fetchMock, async (client, root, dir) => {
+      const input = join(root, 'dragon.png');
+      await writeFile(input, Buffer.from(pngData(), 'base64'));
+      const result = await client.callTool({
+        name: 'animate_image',
+        arguments: {
+          prompt: 'The dragon waves silently',
+          model: 'heygen/heygen-video-1',
+          input_image_path: input,
+          generate_audio: false,
+          allow_paid: true,
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: string }).error).toContain('VIDEO_AUDIO_REQUIRED');
+      expect((result.structuredContent as { error: string }).error).toContain('exige áudio');
+      await expect(readFile(join(dir, 'data', 'requests.json'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+    expect(posts).toBe(0);
+  });
+
+  it('preserves explicit true and false for models that advertise configurable audio', async () => {
+    const submitted: Array<Record<string, unknown>> = [];
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/videos/models')) return Response.json(videoCatalog(true));
+      if (url.endsWith('/videos') && init?.method === 'POST') {
+        submitted.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return Response.json({ id: `veo-job-${submitted.length}`, status: 'pending' }, { status: 202 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+    await withMcp(fetchMock, async (client, _root, dir) => {
+      for (const value of [true, false]) {
+        const result = await client.callTool({
+          name: 'generate_video',
+          arguments: {
+            prompt: `Audio option ${value}`,
+            model: 'google/veo-3.1',
+            duration: 5,
+            resolution: '480p',
+            aspect_ratio: '16:9',
+            generate_audio: value,
+            allow_paid: true,
+          },
+        });
+        expect(result.isError).not.toBe(true);
+      }
+      expect(submitted.map((body) => body.generate_audio)).toEqual([true, false]);
+      const jobs = JSON.parse(await readFile(join(dir, 'data', 'jobs.json'), 'utf8')) as Array<{
+        config: { generate_audio?: boolean };
+      }>;
+      expect(jobs.map((job) => job.config.generate_audio)).toEqual([true, false]);
+    });
+  });
+
+  it('shows the exact HeyGen dry-run payload shape without base64 or an audio flag', async () => {
+    let posts = 0;
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/videos/models')) return Response.json(videoCatalog());
+      if (url.endsWith('/videos') && init?.method === 'POST') {
+        posts += 1;
+        return Response.json({ id: 'unexpected' }, { status: 202 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+    await withMcp(fetchMock, async (client, root) => {
+      const input = join(root, 'dragon.png');
+      await writeFile(input, Buffer.from(pngData(), 'base64'));
+      const result = await client.callTool({
+        name: 'animate_image',
+        arguments: {
+          prompt: 'The dragon waves',
+          model: 'heygen/heygen-video-1',
+          input_image_path: input,
+          duration: 5,
+          resolution: '480p',
+          aspect_ratio: '1:1',
+          dry_run: true,
+        },
+      });
+      expect(result.isError).not.toBe(true);
+      const dryRun = result.structuredContent as {
+        configuration: Record<string, unknown>;
+        estimate: { estimateUsd: number };
+      };
+      expect(dryRun.configuration).toEqual({
+        model: 'heygen/heygen-video-1',
+        prompt: 'The dragon waves',
+        duration: 5,
+        resolution: '480p',
+        aspect_ratio: '1:1',
+        frame_images: [
+          {
+            type: 'image_url',
+            frame_type: 'first_frame',
+            image_url: { url: '[data URL image/png omitida]' },
+          },
+        ],
+      });
+      expect(JSON.stringify(dryRun.configuration)).not.toContain('base64');
+      expect(dryRun.estimate.estimateUsd).toBe(0.1);
+      const estimate = await client.callTool({
+        name: 'estimate_cost',
+        arguments: {
+          type: 'video',
+          model: 'heygen/heygen-video-1',
+          operation: 'animate',
+          duration: 5,
+          resolution: '480p',
+        },
+      });
+      expect(estimate.isError).not.toBe(true);
+      expect(estimate.structuredContent).toMatchObject({
+        estimateUsd: 0.1,
+        audio_policy: { mode: 'always_on' },
+        audio_parameter: 'omitted',
+      });
+      const cannotDisableAudio = await client.callTool({
+        name: 'estimate_cost',
+        arguments: {
+          type: 'video',
+          model: 'heygen/heygen-video-1',
+          operation: 'animate',
+          duration: 5,
+          resolution: '480p',
+          generate_audio: false,
+        },
+      });
+      expect(cannotDisableAudio.isError).toBe(true);
+      expect((cannotDisableAudio.structuredContent as { error: string }).error).toContain(
+        'VIDEO_AUDIO_REQUIRED',
+      );
+    });
+    expect(posts).toBe(0);
+  });
+
+  it('releases a cost reservation after HTTP 400 and never retries the paid POST', async () => {
+    let posts = 0;
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/videos/models')) return Response.json(videoCatalog());
+      if (url.endsWith('/videos') && init?.method === 'POST') {
+        posts += 1;
+        return Response.json({ error: 'invalid video parameters' }, { status: 400 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+    await withMcp(fetchMock, async (client, _root, dir) => {
+      const result = await client.callTool({
+        name: 'generate_video',
+        arguments: {
+          prompt: 'A fox waves',
+          model: 'heygen/heygen-video-1',
+          duration: 5,
+          resolution: '480p',
+          allow_paid: true,
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: string }).error).toContain('HTTP 400');
+      expect(JSON.parse(await readFile(join(dir, 'data', 'requests.json'), 'utf8'))).toEqual([]);
+      await expect(readFile(join(dir, 'data', 'usage.json'), 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+    expect(posts).toBe(1);
   });
 
   it('submits a video job, persists it, polls completion, and streams a mock MP4', async () => {

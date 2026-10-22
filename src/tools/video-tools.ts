@@ -12,6 +12,7 @@ import { type CostEstimate } from '../services/cost-guard.js';
 import type { JobManager } from '../services/job-manager.js';
 import type { MetadataStore } from '../services/metadata-store.js';
 import type { ModelRegistry } from '../services/model-registry.js';
+import { resolveGenerateAudio, videoAudioCapability } from '../services/video-capabilities.js';
 import { safely } from './result.js';
 
 const videoBase = z.object({
@@ -59,7 +60,7 @@ function selectVideoOptions(
   const duration = args.duration ?? (durations?.length ? Math.min(...durations) : undefined);
   const resolution = args.resolution ?? lowestResolution(model.supported_resolutions);
   const aspectRatio = args.aspect_ratio;
-  const generateAudio = args.generate_audio ?? false;
+  const generateAudio = resolveGenerateAudio(model, args.generate_audio);
   if (args.duration !== undefined && (!durations || !durations.includes(args.duration))) {
     throw new AppError(
       `Duração ${args.duration}s não aparece entre as capacidades publicadas de ${model.id}.`,
@@ -84,13 +85,12 @@ function selectVideoOptions(
       'UNSUPPORTED_VIDEO_ASPECT_RATIO',
     );
   }
-  if (generateAudio && model.generate_audio !== true) {
-    throw new AppError(
-      `O catálogo não confirma geração de áudio para ${model.id}.`,
-      'UNSUPPORTED_VIDEO_AUDIO',
-    );
-  }
-  return { duration, resolution, aspectRatio, generateAudio };
+  return {
+    duration,
+    resolution,
+    aspectRatio,
+    ...(generateAudio !== undefined ? { generateAudio } : {}),
+  };
 }
 
 function validateFrameSupport(model: VideoModel): void {
@@ -138,7 +138,7 @@ function videoBody(
     duration?: number;
     resolution?: string;
     aspectRatio?: string;
-    generateAudio: boolean;
+    generateAudio?: boolean;
     frameImage?: string;
   },
 ): OpenRouterVideoRequest {
@@ -148,7 +148,7 @@ function videoBody(
     ...(options.duration !== undefined ? { duration: options.duration } : {}),
     ...(options.resolution ? { resolution: options.resolution } : {}),
     ...(options.aspectRatio ? { aspect_ratio: options.aspectRatio } : {}),
-    generate_audio: options.generateAudio,
+    ...(options.generateAudio !== undefined ? { generate_audio: options.generateAudio } : {}),
     ...(options.frameImage
       ? {
           frame_images: [
@@ -166,7 +166,7 @@ function estimateVideo(
     duration?: number;
     resolution?: string;
     aspectRatio?: string;
-    generateAudio: boolean;
+    generateAudio?: boolean;
     frameImageCount: number;
     inputReferenceCount: number;
   },
@@ -330,6 +330,7 @@ async function submitVideo(
     status: job.status,
     model: job.model,
     created_at: job.createdAt,
+    audio_policy: videoAudioCapability(args.model),
     configuration: job.config,
     estimate: args.estimate,
     file_available: false,
@@ -341,7 +342,7 @@ export function registerVideoTools(server: McpServer, deps: VideoDeps): void {
     'generate_video',
     {
       description:
-        'Inicia text-to-video de forma assíncrona, persiste o job antes de devolver e não espera a geração terminar. A geração exige allow_paid=true.',
+        'Inicia text-to-video de forma assíncrona e persiste o job. generate_audio é opcional: omitido deixa o fornecedor decidir; HeyGen Video 1 exige áudio. Geração exige allow_paid=true.',
       inputSchema: videoBase,
     },
     async (args) =>
@@ -355,7 +356,14 @@ export function registerVideoTools(server: McpServer, deps: VideoDeps): void {
         });
         const body = videoBody(model.id, args.prompt, options);
         if (args.dry_run)
-          return { success: true, dry_run: true, model: model.id, configuration: body, estimate };
+          return {
+            success: true,
+            dry_run: true,
+            model: model.id,
+            audio_policy: videoAudioCapability(model),
+            configuration: body,
+            estimate,
+          };
         return submitVideo(deps, {
           model,
           prompt: args.prompt,
@@ -374,7 +382,7 @@ export function registerVideoTools(server: McpServer, deps: VideoDeps): void {
     'animate_image',
     {
       description:
-        'Anima uma imagem local como primeiro frame num pedido de vídeo. Só está disponível para modelos que publiquem supported_frame_images.first_frame. O ficheiro é enviado como data URL; os fornecedores podem impor requisitos adicionais de URL pública.',
+        'Anima uma imagem local como primeiro frame num pedido de vídeo. Só está disponível para modelos que publiquem supported_frame_images.first_frame. generate_audio omitido deixa o fornecedor decidir; HeyGen Video 1 exige áudio. O ficheiro é enviado como data URL; alguns fornecedores podem exigir URL HTTPS pública.',
       inputSchema: videoBase.extend({
         input_image_path: z.string().min(1),
         input_image_url: z.string().url().optional(),
@@ -399,6 +407,7 @@ export function registerVideoTools(server: McpServer, deps: VideoDeps): void {
             success: true,
             dry_run: true,
             model: model.id,
+            audio_policy: videoAudioCapability(model),
             input_image_path: input.absolutePath,
             ...(inputImageUrl ? { input_image_url: '[HTTPS image URL omitted]' } : {}),
             configuration: {
