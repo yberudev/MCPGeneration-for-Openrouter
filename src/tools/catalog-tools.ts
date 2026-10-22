@@ -82,6 +82,7 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
         aspect_ratio: z.string().trim().optional(),
         duration: z.number().int().positive().optional(),
         count: z.number().int().min(1).max(deps.config.maxImageVariations).default(1),
+        frame_image_count: z.number().int().min(0).max(2).default(0),
         reference_image_count: z.number().int().min(0).max(20).default(0),
         generate_audio: z.boolean().default(false),
       }),
@@ -160,6 +161,11 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
             'Operações de edição e variação usam o catálogo de imagem.',
             'INVALID_ESTIMATE_OPERATION',
           );
+        if (args.operation === 'animate' && args.reference_image_count > 0)
+          throw new AppError(
+            'animate estima frame_images. Para input_references, use operation="generate" e reference_image_count.',
+            'CONFLICTING_VIDEO_INPUT_MODE',
+          );
         const model = await deps.registry.video(args.model);
         if (args.operation === 'animate' && !model.supported_frame_images?.includes('first_frame'))
           throw new AppError(
@@ -203,10 +209,9 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
             })[0],
           aspectRatio: args.aspect_ratio,
           count: args.count,
-          imageReferences:
-            args.operation === 'animate'
-              ? Math.max(1, args.reference_image_count)
-              : args.reference_image_count,
+          frameImageCount:
+            args.operation === 'animate' ? Math.max(1, args.frame_image_count) : args.frame_image_count,
+          inputReferenceCount: args.reference_image_count,
           generateAudio: args.generate_audio,
         });
         return { success: true, ...estimate };

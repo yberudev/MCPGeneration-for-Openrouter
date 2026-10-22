@@ -1,7 +1,20 @@
-import 'dotenv/config';
 import { homedir } from 'node:os';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { config as loadDotEnv } from 'dotenv';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod/v4';
+
+export function resolveServerRoot(moduleUrl: string): string {
+  return resolve(dirname(fileURLToPath(moduleUrl)), '../..');
+}
+
+const serverRoot = resolveServerRoot(import.meta.url);
+
+export function loadServerEnvironment(root = serverRoot): void {
+  loadDotEnv({ path: join(root, '.env'), quiet: true });
+}
+
+loadServerEnvironment();
 
 const optionalText = z.preprocess(
   (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),

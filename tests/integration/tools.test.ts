@@ -310,7 +310,7 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
       expect(result.isError).not.toBe(true);
       const job = result.structuredContent as { status: string; estimate: { estimateUsd: number } };
       expect(job.status).toBe('pending');
-      expect(job.estimate.estimateUsd).toBe(0.39);
+      expect(job.estimate.estimateUsd).toBe(0.1);
       const frames = submittedBody?.frame_images as Array<{ frame_type: string; image_url: { url: string } }>;
       expect(frames[0]?.frame_type).toBe('first_frame');
       expect(frames[0]?.image_url.url).toContain('data:image/png;base64,');

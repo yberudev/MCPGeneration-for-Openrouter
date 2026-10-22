@@ -36,12 +36,12 @@ export class OpenRouterClient {
     return `${this.options.baseUrl.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
   }
 
-  private headers(json = false): HeadersInit {
-    if (!this.options.apiKey) {
+  private headers(json = false, requireApiKey = true): HeadersInit {
+    if (requireApiKey && !this.options.apiKey) {
       throw new AppError('Define OPENROUTER_API_KEY no ambiente do servidor.', 'MISSING_API_KEY');
     }
     return {
-      Authorization: `Bearer ${this.options.apiKey}`,
+      ...(this.options.apiKey ? { Authorization: `Bearer ${this.options.apiKey}` } : {}),
       ...(json ? { 'Content-Type': 'application/json' } : {}),
     };
   }
@@ -59,12 +59,12 @@ export class OpenRouterClient {
     return parsed.data;
   }
 
-  private async requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async requestJson<T>(path: string, init: RequestInit = {}, requireApiKey = true): Promise<T> {
     let response: Response;
     try {
       response = await this.fetchImpl(this.url(path), {
         ...init,
-        headers: { ...this.headers(init.body !== undefined), ...init.headers },
+        headers: { ...this.headers(init.body !== undefined, requireApiKey), ...init.headers },
         redirect: 'error',
         signal: init.signal ?? AbortSignal.timeout(this.options.timeoutMs),
       });
@@ -139,7 +139,9 @@ export class OpenRouterClient {
   }
 
   async listImageModels(): Promise<ImageModel[]> {
-    const response = imageModelsResponseSchema.safeParse(await this.requestJson<unknown>('/images/models'));
+    const response = imageModelsResponseSchema.safeParse(
+      await this.requestJson<unknown>('/images/models', {}, false),
+    );
     if (!response.success)
       throw new AppError('Catálogo de imagens com formato inesperado.', 'INVALID_CATALOG', {
         cause: response.error,
@@ -148,7 +150,9 @@ export class OpenRouterClient {
   }
 
   async listVideoModels(): Promise<VideoModel[]> {
-    const response = videoModelsResponseSchema.safeParse(await this.requestJson<unknown>('/videos/models'));
+    const response = videoModelsResponseSchema.safeParse(
+      await this.requestJson<unknown>('/videos/models', {}, false),
+    );
     if (!response.success)
       throw new AppError('Catálogo de vídeos com formato inesperado.', 'INVALID_CATALOG', {
         cause: response.error,
@@ -160,7 +164,7 @@ export class OpenRouterClient {
     if (!path.startsWith('/api/v1/images/models/') || path.includes('..')) {
       throw new AppError('O catálogo devolveu um caminho de endpoint inválido.', 'INVALID_CATALOG_PATH');
     }
-    return this.requestJson(path.replace(/^\/api\/v1/, ''));
+    return this.requestJson(path.replace(/^\/api\/v1/, ''), {}, false);
   }
 
   generateImage(body: OpenRouterImageRequest): Promise<ImageGenerationResponse> {

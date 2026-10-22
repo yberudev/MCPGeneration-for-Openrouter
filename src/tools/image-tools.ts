@@ -362,14 +362,20 @@ export function registerImageTools(server: McpServer, deps: ImageDeps): void {
           references: 1,
         });
         const estimate = await estimateImage(deps, model, 1, 'edit');
-        if (args.dry_run)
+        if (args.dry_run) {
+          const request = requestBody(model.id, args.prompt, {
+            ...args,
+            reference: `[data URL ${input.info.mimeType} omitida em dry_run]`,
+          });
           return {
             success: true,
             dry_run: true,
             model: model.id,
             input_image_path: input.absolutePath,
             estimate,
+            request,
           };
+        }
         await deps.assets.outputDirectory(args.output_dir, 'image');
         const body = requestBody(model.id, args.prompt, { ...args, reference: input.dataUrl });
         const intentId = await deps.costs.authorize(

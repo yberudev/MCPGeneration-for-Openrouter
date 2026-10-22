@@ -53,7 +53,7 @@ npm ci
 cp .env.example .env
 ```
 
-Edite `.env` e configure `OPENROUTER_API_KEY`. O ficheiro `.env` está ignorado pelo Git. Para uma execução local a partir desta pasta, o `dotenv` carrega esse ficheiro. Para Claude Code, configure a variável no ambiente que inicia o Claude ou use a interpolação descrita abaixo; uma entrada `.mcp.json` não deve conter uma chave literal.
+Edite `.env` e configure `OPENROUTER_API_KEY`. O ficheiro `.env` está ignorado pelo Git. O servidor carrega o `.env` da sua própria pasta de instalação, mesmo quando Claude Code o inicia com o diretório de outro projeto como `cwd`. O ambiente do processo tem prioridade; uma entrada `.mcp.json` versionada não deve conter uma chave literal.
 
 ```bash
 npm run build
@@ -66,7 +66,7 @@ Inicie o servidor localmente com `npm start`. Num terminal, o processo fica à e
 
 ## Integração com Claude Code
 
-Claude Code define `CLAUDE_PROJECT_DIR` no processo do servidor MCP. Assim, o projeto ativo passa a ser a raiz autorizada sem depender de `process.cwd()`.
+Claude Code define `CLAUDE_PROJECT_DIR` no processo do servidor MCP. Assim, o projeto ativo passa a ser a raiz autorizada sem depender de `process.cwd()`. Num registo global, a chave pode ficar no `.env` da pasta de instalação deste servidor ou no ambiente que inicia Claude Code. O carregamento do `.env` é ancorado à pasta de instalação, não ao projeto aberto.
 
 1. Exporte a chave no terminal ou no gestor de ambiente usado para iniciar Claude Code:
 
@@ -118,7 +118,7 @@ O estado local fica em `~/.local/share/mcp-generation-openrouter/` por omissão.
 - `dry_run=true` consulta capacidades e custos, mas não inicia uma geração.
 - Antes de cada POST, o servidor reserva a despesa e guarda um hash do pedido. Se o resultado de um POST ficar incerto por timeout ou falha 5xx, não repete o pedido; a reserva permanece para bloquear uma duplicação. Depois de confirmar a atividade no OpenRouter, reconcilie a entrada correspondente em `requests.json`/`usage.json` antes de remover uma reserva.
 
-Nenhuma chave ou chamada de geração paga é necessária para iniciar o processo ou descobrir ferramentas. As chamadas aos catálogos são GET e não geram conteúdo.
+Nenhuma chave ou chamada de geração paga é necessária para iniciar o processo ou descobrir ferramentas. As consultas GET públicas dos catálogos de modelos e preços não enviam a chave. Consultar estado de uma tarefa, gerar conteúdo ou descarregar vídeo requer autenticação.
 
 ## Text-to-video e image-to-video
 
@@ -126,7 +126,7 @@ Nenhuma chave ou chamada de geração paga é necessária para iniciar o process
 
 `animate_image` envia a imagem local como `frame_images[0]` com `frame_type: "first_frame"`, desde que o modelo publique essa capacidade. O pedido local usa uma data URL; alguns fornecedores exigem uma imagem HTTPS pública e podem rejeitá-la. Nessa situação, passe `input_image_url` HTTPS de uma imagem publicamente acessível; o MCP não descarrega esse URL e não lhe envia a chave OpenRouter. URLs com IP literal, host local, credenciais ou fragmentos são recusados. O servidor não hospeda automaticamente uma imagem local na Internet.
 
-`input_references` para imagens orienta uma edição/variação. `frame_images` fixa uma imagem num ponto específico do vídeo. A disponibilidade dos dois modos é diferente por modelo. Este projeto gera ficheiros multimédia; não cria modelos 3D manipuláveis nem animações interativas.
+`frame_images` fixa uma imagem num ponto específico do vídeo; `input_references` dá imagens para orientar a cena sem fixar o frame. O custo usa SKUs diferentes: para HeyGen Video, a consulta real de 22-10-2026 publica, a 480p, `$0.02/s` em `duration_seconds_480p`, `$0.07/s` em `reference_duration_seconds_480p` e `$0.04` por imagem em `reference_input_images`. Assim, cinco segundos a 480p estimam `$0.10` para texto ou primeiro frame e `$0.39` para uma imagem de referência. O custo real continua a ser o informado pelo OpenRouter após a geração. Este projeto gera ficheiros multimédia; não cria modelos 3D manipuláveis nem animações interativas.
 
 ## Exemplos
 
@@ -134,7 +134,9 @@ Os prompts e os padrões para personagem, edição, animação e homepage estão
 
 ## Testes
 
-`npm test` usa respostas HTTP simuladas e um cliente MCP de teste. Abrange descoberta de ferramentas, geração/edição/variações, submissão e recuperação de jobs, download interrompido, limites, persistência, deteção de formato e restrições de caminhos. Os testes não usam uma API key nem consomem créditos.
+`npm test` usa respostas HTTP simuladas e um cliente MCP de teste. Abrange descoberta de ferramentas, geração/edição/variações, submissão e recuperação de jobs, download interrompido, limites, persistência, deteção de formato e restrições de caminhos. Inclui um teste com dois processos concorrentes que tenta reservar o mesmo orçamento. Estes testes não usam uma API key nem consomem créditos.
+
+`npm run test:catalog` consulta os catálogos e preços reais, verifica Nano Banana 2, Nano Banana 2 Lite e HeyGen Video e executa `dry_run` de geração, edição, vídeo e animação. O teste faz apenas GET e verifica que nenhum POST foi enviado; requer acesso à Internet, mas não uma API key nem créditos.
 
 Existe um teste pago de uma imagem em `tests/paid/`. Só corre se as variáveis estiverem explicitamente configuradas, incluindo `RUN_PAID_TESTS=true`, `OPENROUTER_API_KEY`, `YBERU_PROJECT_ROOT`, `ALLOW_UNKNOWN_COST=true` e `PAID_TEST_MAX_COST_USD`. **Não foi executado durante este desenvolvimento.**
 

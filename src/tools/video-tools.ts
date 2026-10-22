@@ -167,7 +167,8 @@ function estimateVideo(
     resolution?: string;
     aspectRatio?: string;
     generateAudio: boolean;
-    imageReferences: number;
+    frameImageCount: number;
+    inputReferenceCount: number;
   },
 ): CostEstimate {
   return deps.costs.videoEstimate(model, {
@@ -175,7 +176,8 @@ function estimateVideo(
     resolution: options.resolution,
     aspectRatio: options.aspectRatio,
     generateAudio: options.generateAudio,
-    imageReferences: options.imageReferences,
+    frameImageCount: options.frameImageCount,
+    inputReferenceCount: options.inputReferenceCount,
   });
 }
 
@@ -346,7 +348,11 @@ export function registerVideoTools(server: McpServer, deps: VideoDeps): void {
       safely(async () => {
         const model = await deps.registry.video(args.model ?? deps.config.defaultVideoModel);
         const options = selectVideoOptions(model, args);
-        const estimate = estimateVideo(deps, model, { ...options, imageReferences: 0 });
+        const estimate = estimateVideo(deps, model, {
+          ...options,
+          frameImageCount: 0,
+          inputReferenceCount: 0,
+        });
         const body = videoBody(model.id, args.prompt, options);
         if (args.dry_run)
           return { success: true, dry_run: true, model: model.id, configuration: body, estimate };
@@ -381,7 +387,11 @@ export function registerVideoTools(server: McpServer, deps: VideoDeps): void {
         const options = selectVideoOptions(model, args);
         const input = await deps.assets.readInputImage(args.input_image_path);
         const inputImageUrl = args.input_image_url ? validateImageUrl(args.input_image_url) : undefined;
-        const estimate = estimateVideo(deps, model, { ...options, imageReferences: 1 });
+        const estimate = estimateVideo(deps, model, {
+          ...options,
+          frameImageCount: 1,
+          inputReferenceCount: 0,
+        });
         const frameImage = inputImageUrl ?? input.dataUrl;
         const body = videoBody(model.id, args.prompt, { ...options, frameImage });
         if (args.dry_run)

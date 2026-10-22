@@ -22,9 +22,17 @@ describe('OpenRouterClient', () => {
     await expect(client.listImageModels()).rejects.toThrow('créditos insuficientes');
   });
 
-  it('requires an API key only when an API call is made and rejects malformed catalogs', async () => {
-    const missingKey = new OpenRouterClient({ baseUrl: 'https://openrouter.ai/api/v1', timeoutMs: 1_000 });
-    await expect(missingKey.listVideoModels()).rejects.toMatchObject({ code: 'MISSING_API_KEY' });
+  it('allows public catalog GETs without a key and protects authenticated API calls', async () => {
+    const missingKey = new OpenRouterClient({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      timeoutMs: 1_000,
+      fetchImpl: async (_input, init) => {
+        expect(new Headers(init?.headers).has('authorization')).toBe(false);
+        return Response.json({ data: [] });
+      },
+    });
+    await expect(missingKey.listVideoModels()).resolves.toEqual([]);
+    await expect(missingKey.getVideo('job-1')).rejects.toMatchObject({ code: 'MISSING_API_KEY' });
     const malformed = new OpenRouterClient({
       baseUrl: 'https://openrouter.ai/api/v1',
       apiKey: 'test',

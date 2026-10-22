@@ -1,6 +1,6 @@
 # Configuração
 
-O servidor lê variáveis do processo. `dotenv` carrega `.env` a partir do diretório de trabalho para execuções locais; numa configuração do Claude Code, use variáveis do ambiente/interpolação em `.mcp.json`.
+O servidor lê variáveis do processo. `dotenv` carrega `.env` da pasta de instalação do servidor, resolvida a partir do módulo, em vez do diretório de trabalho. Um MCP registado globalmente continua a encontrar essa chave quando Claude Code o inicia a partir de outro projeto. Variáveis herdadas do processo têm prioridade. Não grave a chave num `.mcp.json` versionado.
 
 | Variável                   | Padrão                                     | Descrição                                                                 |
 | -------------------------- | ------------------------------------------ | ------------------------------------------------------------------------- |
@@ -23,6 +23,6 @@ O servidor lê variáveis do processo. `dotenv` carrega `.env` a partir do diret
 | `ALLOW_UNKNOWN_COST`       | `false`                                    | Permite explicitamente um pedido cujo custo prévio não é verificável.     |
 | `LOG_LEVEL`                | `info`                                     | Reservado para logging operacional; não altera a saída MCP.               |
 
-Uma variável em branco usa o padrão. A configuração é validada no arranque. O servidor não precisa de API key para iniciar, mas necessita dela para pedir catálogos e conteúdos.
+Uma variável em branco usa o padrão. A configuração é validada no arranque. O servidor não precisa de API key para iniciar nem para consultar os catálogos públicos por GET. Precisa dela para gerar conteúdo, consultar estado ou descarregar vídeo.
 
 `RUN_PAID_TESTS` e `PAID_TEST_MAX_COST_USD` só se aplicam ao teste pago opcional; veja o README.

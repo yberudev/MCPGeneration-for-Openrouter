@@ -12,7 +12,9 @@ As entradas são validadas por Zod v4. As respostas usam `structuredContent` e t
 | `animate_image`       | `input_image_path`, `input_image_url?`, `prompt`, parâmetros de vídeo              | Usa `frame_images` com primeiro frame; exige suporte publicado pelo modelo.           |
 | `get_video_status`    | `job_id` local ou remoto                                                           | Atualiza o registo existente; falha de consulta não cria outro pedido.                |
 | `download_video`      | `job_id`, `output_dir?`, `filename?`, `index?`                                     | Exige estado concluído, streaming, limite, MIME/assinatura e gravação exclusiva.      |
-| `estimate_cost`       | `type`, `model`, `operation`, parâmetros de preço                                  | Usa endpoint de preços de imagem ou `pricing_skus` de vídeo; pode devolver `unknown`. |
+| `estimate_cost`       | `type`, `model`, `operation`, `frame_image_count`, `reference_image_count`         | Usa SKUs separados para `frame_images` e `input_references`; pode devolver `unknown`. |
 | `list_assets`         | `type`, `limit`, `project_root?`                                                   | Lista metadados, sem conteúdo binário.                                                |
 
 Todas as operações de geração aceitam `dry_run` quando aplicável e exigem `allow_paid: true` fora do modo de simulação. `max_cost_usd` não remove limites globais. Consulte sempre o catálogo atual com `list_models` antes de escolher parâmetros.
+
+Em `estimate_cost` para vídeo, `operation="animate"` calcula o custo do primeiro frame (`frame_images`). `reference_image_count` calcula uma referência (`input_references`). Não combine os dois modos num único cálculo. Para HeyGen Video, o catálogo consultado publica `$0.02/s` em `duration_seconds_480p`, `$0.07/s` em `reference_duration_seconds_480p` e `$0.04` por imagem em `reference_input_images`.

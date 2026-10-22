@@ -71,25 +71,34 @@ export class CostGuard {
       duration?: number;
       resolution?: string;
       count?: number;
-      imageReferences?: number;
+      frameImageCount?: number;
+      inputReferenceCount?: number;
       generateAudio?: boolean;
       aspectRatio?: string;
     },
   ): CostEstimate {
     const sku = model.pricing_skus ?? {};
     const count = options.count ?? 1;
+    const frameImageCount = options.frameImageCount ?? 0;
+    const inputReferenceCount = options.inputReferenceCount ?? 0;
+    if (frameImageCount > 0 && inputReferenceCount > 0) {
+      return this.unknownVideo(
+        model,
+        options,
+        'O catálogo não define uma estimativa combinada para frame_images e input_references no mesmo pedido.',
+      );
+    }
     const resolution = resolutionToken(options.resolution);
-    const prefix =
-      options.imageReferences && options.imageReferences > 0
-        ? 'reference_duration_seconds_'
-        : 'duration_seconds_';
+    const inputMode =
+      inputReferenceCount > 0 ? 'input_references' : frameImageCount > 0 ? 'frame_images' : 'text';
+    const prefix = inputMode === 'input_references' ? 'reference_duration_seconds_' : 'duration_seconds_';
     let rate: number | undefined;
     if (resolution) rate = numeric(sku[`${prefix}${resolution}`]);
-    if (rate === undefined && resolution) {
+    if (rate === undefined && resolution && inputMode !== 'input_references') {
       const cents = numeric(sku[`cents_per_video_output_second_${resolution}`]);
       if (cents !== undefined) rate = cents / 100;
     }
-    if (rate === undefined && !options.imageReferences) {
+    if (rate === undefined && inputMode !== 'input_references') {
       rate = numeric(sku.duration_seconds) ?? numeric(sku.cents_per_second_output);
       if (
         rate !== undefined &&
@@ -105,8 +114,8 @@ export class CostGuard {
         options,
         'O catálogo não publicou uma tarifa por segundo compatível com os parâmetros escolhidos.',
       );
-    const referenceInputRate = options.imageReferences ? numeric(sku.reference_input_images) : 0;
-    if (options.imageReferences && referenceInputRate === undefined) {
+    const referenceInputRate = inputReferenceCount > 0 ? numeric(sku.reference_input_images) : 0;
+    if (inputReferenceCount > 0 && referenceInputRate === undefined) {
       return this.unknownVideo(
         model,
         options,
@@ -116,7 +125,7 @@ export class CostGuard {
     if (options.generateAudio && !Object.keys(sku).some((key) => key.toLowerCase().includes('audio'))) {
       return this.unknownVideo(model, options, 'O catálogo não separa eventual custo adicional de áudio.');
     }
-    const estimate = (rate * duration + (referenceInputRate ?? 0) * (options.imageReferences ?? 0)) * count;
+    const estimate = (rate * duration + (referenceInputRate ?? 0) * inputReferenceCount) * count;
     return {
       status: 'estimated',
       estimateUsd: Number(estimate.toFixed(6)),
@@ -128,13 +137,15 @@ export class CostGuard {
         resolution: options.resolution,
         aspectRatio: options.aspectRatio,
         count,
-        imageReferences: options.imageReferences ?? 0,
+        inputMode,
+        frameImageCount,
+        inputReferenceCount,
         generateAudio: options.generateAudio ?? false,
         pricePerSecondUsd: rate,
         referenceInputImageUsd: referenceInputRate ?? 0,
       },
       limitations: [
-        'A estimativa usa a tarifa correspondente publicada no catálogo; o custo final de fornecedor pode diferir.',
+        'frame_images usa a tarifa duration_seconds; input_references usa reference_duration_seconds e reference_input_images quando publicados. O custo final pode diferir.',
       ],
     };
   }

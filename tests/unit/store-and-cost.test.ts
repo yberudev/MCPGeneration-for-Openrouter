@@ -1,11 +1,15 @@
+import { execFile } from 'node:child_process';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/env.js';
 import { CostGuard } from '../../src/services/cost-guard.js';
 import { JobManager, normalizeVideoStatus } from '../../src/services/job-manager.js';
 import { MetadataStore } from '../../src/services/metadata-store.js';
+
+const execFileAsync = promisify(execFile);
 
 describe('video job persistence and cost guard', () => {
   it('normalizes and recovers task states from persistent JSON', async () => {
@@ -31,18 +35,34 @@ describe('video job persistence and cost guard', () => {
     const store = new MetadataStore(dir);
     await store.init();
     const guard = new CostGuard(loadConfig({ YBERU_DATA_DIR: dir }), store);
-    const estimate = guard.videoEstimate(
-      {
-        id: 'heygen/heygen-video-1',
-        pricing_skus: { duration_seconds_480p: '0.02' },
+    const model = {
+      id: 'heygen/heygen-video-1',
+      pricing_skus: {
+        duration_seconds_480p: '0.02',
+        reference_duration_seconds_480p: '0.07',
+        reference_input_images: '0.04',
       },
-      { duration: 5, resolution: '480p' },
-    );
-    expect(estimate.estimateUsd).toBe(0.1);
-    await expect(guard.authorize(estimate, { allowPaid: false }, 'generate_video', 'no-pay')).rejects.toThrow(
-      'allow_paid',
-    );
-    const id = await guard.authorize(estimate, { allowPaid: true }, 'generate_video', 'pay');
+    };
+    const textEstimate = guard.videoEstimate(model, { duration: 5, resolution: '480p' });
+    const frameEstimate = guard.videoEstimate(model, {
+      duration: 5,
+      resolution: '480p',
+      frameImageCount: 1,
+    });
+    const referenceEstimate = guard.videoEstimate(model, {
+      duration: 5,
+      resolution: '480p',
+      inputReferenceCount: 1,
+    });
+    expect(textEstimate.estimateUsd).toBe(0.1);
+    expect(frameEstimate.estimateUsd).toBe(0.1);
+    expect(referenceEstimate.estimateUsd).toBe(0.39);
+    expect(frameEstimate.parameters.inputMode).toBe('frame_images');
+    expect(referenceEstimate.parameters.inputMode).toBe('input_references');
+    await expect(
+      guard.authorize(textEstimate, { allowPaid: false }, 'generate_video', 'no-pay'),
+    ).rejects.toThrow('allow_paid');
+    const id = await guard.authorize(textEstimate, { allowPaid: true }, 'generate_video', 'pay');
     expect(id).toBeTruthy();
     await store.releasePaidRequest(id);
   });
@@ -110,4 +130,19 @@ describe('video job persistence and cost guard', () => {
       guard.authorize(estimate, { allowPaid: true }, 'generate_video', 'same-request'),
     ).rejects.toMatchObject({ code: 'DUPLICATE_UNCERTAIN_REQUEST' });
   });
+
+  it('serializes budget reservations across separate Node.js processes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-cross-process-budget-'));
+    const childScript = resolve('tests/fixtures/reserve-spend-child.ts');
+    const runChild = (fingerprint: string) =>
+      execFileAsync(process.execPath, ['--import', 'tsx', childScript, dir, fingerprint], {
+        cwd: process.cwd(),
+        timeout: 20_000,
+      });
+    const results = await Promise.all([runChild('process-a'), runChild('process-b')]);
+    const outcomes = results.map(({ stdout }) => stdout.trim()).sort();
+    expect(outcomes).toEqual(['TOTAL_SPEND_LIMIT', 'reserved']);
+    const store = new MetadataStore(dir);
+    expect(await store.totalSpendUsd()).toBe(0.75);
+  }, 30_000);
 });

@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import * as lockfile from 'proper-lockfile';
 import { AppError } from '../utils/errors.js';
 
 export interface AssetRecord {
@@ -113,10 +114,27 @@ export class MetadataStore {
       unlock = resolve;
     });
     await prior;
+    let release: (() => Promise<void>) | undefined;
     try {
+      release = await lockfile.lock(this.dataDir, {
+        stale: 30_000,
+        update: 10_000,
+        retries: { retries: 100, factor: 1.2, minTimeout: 25, maxTimeout: 250, randomize: true },
+      });
       return await work();
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError(
+        'Não foi possível adquirir ou manter o bloqueio partilhado dos metadados. Nenhuma reserva foi confirmada.',
+        'METADATA_LOCK_ERROR',
+        { cause: error },
+      );
     } finally {
-      unlock();
+      try {
+        await release?.();
+      } finally {
+        unlock();
+      }
     }
   }
 
