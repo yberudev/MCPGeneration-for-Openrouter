@@ -5,6 +5,7 @@ import { CostGuard } from './services/cost-guard.js';
 import { ImageJobQueue } from './services/image-job-queue.js';
 import { ImageJobWorker } from './services/image-job-worker.js';
 import { MetadataStore } from './services/metadata-store.js';
+import { ModelRegistry } from './services/model-registry.js';
 import { sanitizeErrorMessage } from './utils/errors.js';
 
 const config = loadConfig();
@@ -18,9 +19,11 @@ const client = new OpenRouterClient({
   timeoutMs: config.httpTimeoutMs,
   maxResponseBytes: config.maxHttpResponseBytes,
 });
+const registry = new ModelRegistry(client);
 const worker = new ImageJobWorker({
   config,
   client,
+  registry,
   assets: new AssetManager(config, store),
   costs: new CostGuard(config, store),
   store,

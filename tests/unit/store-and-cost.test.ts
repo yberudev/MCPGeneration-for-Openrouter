@@ -131,6 +131,36 @@ describe('video job persistence and cost guard', () => {
     ).rejects.toMatchObject({ code: 'DUPLICATE_UNCERTAIN_REQUEST' });
   });
 
+  it('refreshes an existing pre-POST reservation atomically when the live estimate changes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'mcp-refresh-reservation-'));
+    const store = new MetadataStore(dir);
+    await store.init();
+    const config = loadConfig({
+      YBERU_DATA_DIR: dir,
+      MAX_TOTAL_SPEND_USD: '1',
+      MAX_COST_PER_REQUEST_USD: '1',
+    });
+    const guard = new CostGuard(config, store);
+    const first = {
+      status: 'estimated' as const,
+      kind: 'grounded_estimate' as const,
+      estimateUsd: 0.25,
+      source: 'old catalog snapshot',
+      confidence: 'high' as const,
+      parameters: {},
+      limitations: [],
+    };
+    const refreshed = { ...first, estimateUsd: 0.75, source: 'current catalog snapshot' };
+    const id = await guard.authorize(first, { allowPaid: true }, 'generate_image', 'same-job', 'stable-id');
+    await guard.authorize(refreshed, { allowPaid: true }, 'generate_image', 'same-job', id);
+    expect((await store.paidRequest(id))?.budgetUsd).toBe(0.75);
+    expect(await store.totalSpendUsd()).toBe(0.75);
+    await expect(
+      guard.authorize({ ...refreshed, estimateUsd: 1.01 }, { allowPaid: true }, 'generate_image', 'same-job', id),
+    ).rejects.toMatchObject({ code: 'REQUEST_COST_LIMIT' });
+    expect((await store.paidRequest(id))?.budgetUsd).toBe(0.75);
+  });
+
   it('serializes budget reservations across separate Node.js processes', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'mcp-cross-process-budget-'));
     const childScript = resolve('tests/fixtures/reserve-spend-child.ts');

@@ -1,0 +1,58 @@
+{
+  "retrievedAt": "2026-10-23",
+  "geminiLite": {
+    "model": {
+      "id": "google/gemini-3.1-flash-lite-image",
+      "supported_parameters": {
+        "resolution": { "type": "enum", "values": ["1K"] },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+        },
+        "n": { "type": "range", "min": 1, "max": 1 },
+        "input_references": { "type": "range", "min": 0, "max": 14 }
+      }
+    },
+    "endpointPricing": [
+      { "provider_name": "Google Vertex", "pricing": [{ "billable": "output_image", "unit": "token", "cost_usd": 0.00003 }] },
+      { "provider_name": "Google AI Studio", "pricing": [{ "billable": "output_image", "unit": "token", "cost_usd": 0.00003 }] }
+    ],
+    "modelDetails": {
+      "id": "google/gemini-3.1-flash-lite-image",
+      "context_length": 65536,
+      "pricing": {
+        "prompt": "0.00000025",
+        "completion": "0.0000015",
+        "image_output": "0.00003"
+      },
+      "top_provider": { "context_length": 65536, "max_completion_tokens": 58982 }
+    },
+    "documentedOutputImageTokens1K": 1120
+  },
+  "flux3": {
+    "model": {
+      "id": "black-forest-labs/flux-3-image",
+      "supported_parameters": {
+        "resolution": { "type": "enum", "values": ["768", "1K", "1.5K", "2K", "4K"] },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": ["21:9", "2:1", "16:9", "3:2", "7:5", "4:3", "5:4", "1:1", "4:5", "3:4", "5:7", "2:3", "9:16", "1:2", "9:21", "auto"]
+        },
+        "n": { "type": "range", "min": 1, "max": 1 },
+        "input_references": { "type": "range", "min": 0, "max": 10 }
+      }
+    },
+    "endpointPricing": [
+      {
+        "provider_name": "Black Forest Labs",
+        "pricing": [
+          { "billable": "output_image", "unit": "image", "cost_usd": 0.041, "variant": "768" },
+          { "billable": "output_image", "unit": "image", "cost_usd": 0.048, "variant": "1k" },
+          { "billable": "output_image", "unit": "image", "cost_usd": 0.07, "variant": "1.5k" },
+          { "billable": "output_image", "unit": "image", "cost_usd": 0.1, "variant": "2k" },
+          { "billable": "output_image", "unit": "image", "cost_usd": 0.607, "variant": "4k" }
+        ]
+      }
+    ]
+  }
+}

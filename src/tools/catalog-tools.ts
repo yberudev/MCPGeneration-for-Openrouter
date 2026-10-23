@@ -143,16 +143,30 @@ export function registerCatalogTools(server: McpServer, deps: CatalogDeps): void
             }
           }
           let pricing: unknown;
+          let modelDetails;
           try {
             pricing = await deps.registry.imagePricing(model);
           } catch {
             /* return unknown rather than inventing */
+          }
+          if (model.id === 'google/gemini-3.1-flash-lite-image') {
+            try {
+              modelDetails = await deps.registry.modelDetails(model.id);
+            } catch {
+              /* return unknown rather than inventing */
+            }
           }
           const estimate = deps.costs.imageEstimate(
             model,
             pricing,
             args.count,
             args.operation === 'variation' ? 'variation' : args.operation === 'edit' ? 'edit' : 'generate',
+            {
+              resolution: args.resolution,
+              aspectRatio: args.aspect_ratio,
+              referenceCount: references,
+              modelDetails,
+            },
           );
           return { success: true, ...estimate };
         }

@@ -6,10 +6,11 @@ import type { AppConfig } from '../config/env.js';
 import type { OpenRouterClient } from '../providers/openrouter/client.js';
 import { getTransportDiagnostic } from '../providers/openrouter/diagnostics.js';
 import { AppError, sanitizeErrorMessage } from '../utils/errors.js';
-import { AssetManager, detectImage } from './asset-manager.js';
+import { AssetManager, detectImage, type ImageInfo } from './asset-manager.js';
 import { CostGuard, type CostEstimate } from './cost-guard.js';
 import type { MetadataStore } from './metadata-store.js';
 import type { ImageJobQueue, ImageJob, PersistedImageOutput } from './image-job-queue.js';
+import type { ModelRegistry } from './model-registry.js';
 
 export interface ImageWorkerDependencies {
   config: AppConfig;
@@ -18,10 +19,12 @@ export interface ImageWorkerDependencies {
   costs: CostGuard;
   store: MetadataStore;
   queue: ImageJobQueue;
+  registry?: ModelRegistry;
   pollIntervalMs?: number;
   wait?: (ms: number) => Promise<void>;
   logger?: (event: Record<string, unknown>) => void;
   assetsForJob?: (job: ImageJob, config: AppConfig, store: MetadataStore) => AssetManager;
+  imageDetector?: (bytes: Buffer) => ImageInfo;
 }
 
 function responseStatus(error: unknown): number | null {
@@ -43,8 +46,8 @@ function technicalError(error: unknown, status: number | null): string {
     const codes = diagnostic.error_codes.length ? ` (${diagnostic.error_codes.join(', ')})` : '';
     return `OpenRouter respondeu HTTP ${status}; falha ao ler os detalhes${codes} após ${diagnostic.duration_ms} ms.`;
   }
-  if (status !== null && !diagnostic) return `OpenRouter respondeu HTTP ${status}.`;
   const code = error instanceof AppError ? error.code : 'WORKER_ERROR';
+  if (status !== null && status !== 200 && !diagnostic) return `OpenRouter respondeu HTTP ${status}.`;
   if (diagnostic) {
     const phases: Record<string, string> = {
       dns: 'resolução DNS',
@@ -63,8 +66,16 @@ function technicalError(error: unknown, status: number | null): string {
   const messages: Record<string, string> = {
     NETWORK_ERROR: 'Falha de rede ou timeout; o resultado do POST pode ser incerto.',
     INVALID_RESPONSE: 'Resposta do OpenRouter inválida; não houve retry.',
+    IMAGE_RESPONSE_DATA_MISSING: 'A resposta HTTP 200 não continha o campo data esperado.',
     RESPONSE_READ_ERROR: 'A leitura da resposta falhou; não houve retry.',
     RESPONSE_TOO_LARGE: 'Resposta do OpenRouter excedeu o limite local; não houve retry.',
+    RAW_RESPONSE_PERSIST_ERROR: 'A resposta HTTP 200 não pôde ser preservada localmente; a cobrança permanece incerta.',
+    RAW_RESPONSE_STORAGE_LIMIT: 'A quota local de respostas preservadas foi atingida; a cobrança permanece incerta.',
+    PRESERVED_RESPONSE_CORRUPT: 'A resposta HTTP preservada falhou na verificação de integridade.',
+    IMAGE_DATA_MISSING: 'O resultado não continha data[].b64_json.',
+    INVALID_BASE64: 'A resposta continha base64 inválido; a cobrança foi preservada e os bytes HTTP continuam disponíveis para recuperação local.',
+    IMAGE_MIME_MISMATCH: 'O MIME declarado não corresponde ao formato da imagem recebida.',
+    INVALID_IMAGE_FORMAT: 'Os bytes recebidos não correspondem a PNG, JPEG ou WebP reconhecido.',
     IMAGE_POST_UNCERTAIN: 'O estado do POST é incerto e não será repetido.',
     IMAGE_OUTPUT_COUNT_MISMATCH: 'O número de imagens devolvidas foi inferior ao esperado.',
     IMAGE_RESPONSE_EMPTY: 'A resposta não continha uma imagem entregável.',
@@ -74,21 +85,39 @@ function technicalError(error: unknown, status: number | null): string {
   return messages[code] ?? `${code}: erro técnico local sem detalhes sensíveis.`;
 }
 
-function toOutputs(job: ImageJob, response: unknown, maxBytes: number): PersistedImageOutput[] {
+function toOutputs(
+  job: ImageJob,
+  response: unknown,
+  maxBytes: number,
+  imageDetector: (bytes: Buffer) => ImageInfo = detectImage,
+): PersistedImageOutput[] {
   const data = (response as { data?: Array<{ b64_json?: unknown }> })?.data;
-  if (!Array.isArray(data) || !data.length)
+  if (data === undefined)
+    throw new AppError('A resposta não contém o campo data esperado.', 'IMAGE_RESPONSE_DATA_MISSING');
+  if (!Array.isArray(data))
+    throw new AppError('O campo data da resposta não é uma lista.', 'INVALID_RESPONSE');
+  if (!data.length)
     throw new AppError('A resposta não contém imagens geradas.', 'IMAGE_RESPONSE_EMPTY');
   const outputs: PersistedImageOutput[] = [];
   for (let index = 0; index < data.length; index += 1) {
-    const value = data[index]?.b64_json;
-    if (typeof value !== 'string' || Math.ceil(value.length * 0.75) > maxBytes)
-      throw new AppError('A resposta de imagem é inválida ou demasiado grande.', 'INVALID_IMAGE_DATA');
+    const item = data[index] as { b64_json?: unknown; media_type?: unknown } | undefined;
+    const value = item?.b64_json;
+    if (typeof value !== 'string')
+      throw new AppError('A resposta não contém data[].b64_json.', 'IMAGE_DATA_MISSING');
+    if (Math.ceil(value.length * 0.75) > maxBytes)
+      throw new AppError('A resposta de imagem excede o limite local.', 'IMAGE_TOO_LARGE');
     if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
-      throw new AppError('A resposta contém base64 inválido.', 'INVALID_IMAGE_DATA');
+      throw new AppError('A resposta contém base64 inválido.', 'INVALID_BASE64');
     const bytes = Buffer.from(value, 'base64');
-    if (!bytes.length || bytes.length > maxBytes)
+    if (bytes.toString('base64') !== value)
+      throw new AppError('A resposta contém base64 não canónico.', 'INVALID_BASE64');
+    if (!bytes.length)
+      throw new AppError('O campo b64_json não contém bytes de imagem.', 'IMAGE_DATA_MISSING');
+    if (bytes.length > maxBytes)
       throw new AppError('A resposta de imagem está vazia ou excede o limite.', 'IMAGE_TOO_LARGE');
-    const image = detectImage(bytes);
+    const image = imageDetector(bytes);
+    if (item?.media_type !== undefined && item.media_type !== image.mimeType)
+      throw new AppError('O MIME declarado não corresponde à assinatura detetada.', 'IMAGE_MIME_MISMATCH');
     outputs.push({
       index,
       mimeType: image.mimeType,
@@ -97,6 +126,87 @@ function toOutputs(job: ImageJob, response: unknown, maxBytes: number): Persiste
     });
   }
   return outputs;
+}
+
+function safeValueType(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+function safeResponseMetadata(value: unknown): Record<string, unknown> {
+  const object = value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+  const allowedTopFields = ['data', 'usage', 'model', 'created', 'id', 'error'];
+  const metadata: Record<string, unknown> = {
+    jsonValid: object !== undefined,
+    topLevelFields: object ? Object.keys(object).filter((key) => allowedTopFields.includes(key)).sort() : [],
+  };
+  if (!object) return metadata;
+  const data = object.data;
+  metadata.dataState = data === undefined ? 'missing' : Array.isArray(data) ? 'array' : safeValueType(data);
+  if (Array.isArray(data)) {
+    metadata.dataCount = data.length;
+    metadata.items = data.slice(0, 20).map((item) => {
+      const row = item && typeof item === 'object' && !Array.isArray(item)
+        ? (item as Record<string, unknown>)
+        : undefined;
+      if (!row) return { itemType: safeValueType(item) };
+      const fields: Record<string, string> = {};
+      for (const key of ['b64_json', 'media_type', 'revised_prompt', 'url', 'mime_type'])
+        if (Object.hasOwn(row, key)) fields[key] = safeValueType(row[key]);
+      const mime = typeof row.media_type === 'string' ? row.media_type.toLowerCase() : undefined;
+      return {
+        fields,
+        ...(typeof row.b64_json === 'string' ? { b64JsonLength: row.b64_json.length } : {}),
+        ...(mime && ['image/png', 'image/jpeg', 'image/webp'].includes(mime)
+          ? { mediaType: mime }
+          : mime
+            ? { mediaType: 'other' }
+            : {}),
+      };
+    });
+    if (data.length > 20) metadata.itemsTruncated = true;
+  }
+  const usage = object.usage && typeof object.usage === 'object' && !Array.isArray(object.usage)
+    ? (object.usage as Record<string, unknown>)
+    : undefined;
+  const cost = usage?.cost;
+  metadata.usageState = object.usage === undefined ? 'missing' : safeValueType(object.usage);
+  metadata.usageCostState = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0
+    ? 'available'
+    : cost === undefined
+      ? 'missing'
+      : 'invalid';
+  if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) metadata.usageCostUsd = cost;
+  return metadata;
+}
+
+function inspectRawResponse(body: Buffer): {
+  actualCostUsd: number | null;
+  safeMetadata: Record<string, unknown>;
+} {
+  try {
+    const value: unknown = JSON.parse(body.toString('utf8'));
+    const safeMetadata = safeResponseMetadata(value);
+    const usage = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>).usage
+      : undefined;
+    const cost = usage && typeof usage === 'object' && !Array.isArray(usage)
+      ? (usage as Record<string, unknown>).cost
+      : undefined;
+    return {
+      actualCostUsd:
+        typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : null,
+      safeMetadata,
+    };
+  } catch {
+    return {
+      actualCostUsd: null,
+      safeMetadata: { jsonValid: false, parseState: 'invalid_json', topLevelFields: [] },
+    };
+  }
 }
 
 export class ImageJobWorker {
@@ -188,6 +298,7 @@ export class ImageJobWorker {
           this.deps.queue.uncertain(job.id, code, message, status);
         }
       } else if (
+        current?.phase === 'response_preserved' ||
         current?.phase === 'result_parsed' ||
         current?.phase === 'files_persisted' ||
         current?.phase === 'files_persisting' ||
@@ -226,12 +337,16 @@ export class ImageJobWorker {
   }
 
   private estimate(job: ImageJob): CostEstimate {
+    if (job.payload.estimateDetails) return job.payload.estimateDetails;
     return {
       status: job.payload.estimateUsd === null ? 'unknown' : 'estimated',
+      kind: job.payload.estimateUsd === null ? 'unknown' : 'grounded_estimate',
       estimateUsd: job.payload.estimateUsd,
       source: job.payload.estimateSource,
+      sourceDate: job.createdAt,
       confidence: job.payload.estimateUsd === null ? 'none' : 'medium',
       parameters: { model: job.model, operation: job.operation },
+      assumptions: [],
       limitations: [],
     };
   }
@@ -251,8 +366,118 @@ export class ImageJobWorker {
     );
   }
 
-  private async process(job: ImageJob): Promise<void> {
+  private async liveEstimate(job: ImageJob): Promise<CostEstimate> {
+    const modelId = job.model;
+    const body = job.payload.requestBodies[0];
+    const operation =
+      job.operation === 'edit_image' ? 'edit' : job.operation === 'generate_variations' ? 'variation' : 'generate';
+    const options = {
+      resolution: body?.resolution,
+      aspectRatio: body?.aspect_ratio,
+      referenceCount: body?.input_references?.length ?? 0,
+    };
+    if (!this.deps.registry) return this.estimate(job);
+    let model;
+    try {
+      model = await this.deps.registry.image(modelId, true);
+    } catch {
+      return {
+        status: 'unknown',
+        kind: 'unknown',
+        estimateUsd: null,
+        source: 'OpenRouter live image catalog',
+        sourceDate: new Date().toISOString(),
+        confidence: 'none',
+        parameters: { model: modelId, operation, count: job.payload.expectedOutputCount, ...options },
+        assumptions: [],
+        limitations: ['Não foi possível confirmar o modelo e os preços atuais antes da reserva e do POST.'],
+      };
+    }
+    let pricing: unknown;
+    let modelDetails;
+    try {
+      pricing = await this.deps.registry.imagePricing(model);
+    } catch {
+      /* CostGuard returns unknown if the live endpoint pricing is unavailable. */
+    }
+    if (modelId === 'google/gemini-3.1-flash-lite-image') {
+      try {
+        modelDetails = await this.deps.registry.modelDetails(modelId, true);
+      } catch {
+        /* CostGuard returns unknown if a required token price/limit is unavailable. */
+      }
+    }
+    return this.deps.costs.imageEstimate(
+      model,
+      pricing,
+      job.payload.expectedOutputCount,
+      operation,
+      { ...options, modelDetails },
+    );
+  }
+
+  private async accountInterpretationFailure(
+    job: ImageJob,
+    callIndex: number,
+    error: unknown,
+    httpStatus: number,
+  ): Promise<void> {
+    const preserved = this.deps.queue.preservedResponse(job.id, callIndex);
+    if (!preserved)
+      throw new AppError('A resposta não está preservada para recuperação local.', 'PRESERVED_RESPONSE_MISSING');
+    const inspected = inspectRawResponse(preserved.body);
+    const errorCode = error instanceof AppError ? error.code : 'WORKER_ERROR';
+    this.deps.queue.markResponseInterpretationFailed(
+      job.id,
+      callIndex,
+      inspected.actualCostUsd,
+      httpStatus,
+      inspected.safeMetadata,
+      errorCode,
+    );
+    const confirmed = this.deps.queue.confirmedCalls(job.id);
+    const actualCost = confirmed.allCostsKnown ? confirmed.totalCostUsd : null;
+    const financialState = actualCost === null ? 'cost_unknown' : 'accounted';
+    this.deps.queue.setActualCost(job.id, actualCost);
+    await this.deps.store.completePaidRequest(job.requestId, {
+      at: new Date().toISOString(),
+      model: job.model,
+      costUsd: actualCost,
+      budgetUsd: actualCost ?? job.payload.estimateUsd ?? 0,
+      unknownCost: actualCost === null,
+      operation: job.operation,
+      jobId: job.id,
+    });
+    this.deps.queue.setPhase(job.id, 'cost_accounted', 'response_persisted', financialState);
+    this.log({
+      event: 'response_interpretation_failed',
+      job_id: job.id,
+      request_id: job.requestId,
+      model: job.model,
+      http_status: httpStatus,
+      call_index: callIndex,
+      error_code: errorCode,
+      response_bytes: preserved.sizeBytes,
+      response_sha256: preserved.sha256,
+      actual_cost_usd: actualCost,
+      cost_known: actualCost !== null,
+      safe_response_metadata: inspected.safeMetadata,
+      post_retried: false,
+    });
+  }
+
+  private async process(initialJob: ImageJob): Promise<void> {
+    let job = initialJob;
     await this.assetsForJob(job).outputDirectory(job.payload.resolvedOutputDir, 'image');
+    const alreadyReceived = job.payload.requestBodies.some((_, index) => {
+      const state = this.deps.queue.callState(job.id, index);
+      return state === 'response_received' || state === 'response_preserved';
+    });
+    if (!alreadyReceived) {
+      const estimate = await this.liveEstimate(job);
+      this.deps.queue.updateEstimate(job.id, estimate);
+      job = this.deps.queue.get(job.id)!;
+    }
     const costs = this.costsForJob(job);
     costs.validate(this.estimate(job), {
       allowPaid: true,
@@ -275,40 +500,80 @@ export class ImageJobWorker {
       if (callState === 'response_received') continue;
       if (callState === 'post_started')
         throw new AppError('O estado do POST é incerto; o worker não o vai repetir.', 'IMAGE_POST_UNCERTAIN');
-      this.deps.queue.markCallPostStarted(job.id, callIndex);
-      this.log({
-        event: 'http_request_started',
-        job_id: job.id,
-        request_id: job.requestId,
-        model: job.model,
-        call_index: callIndex,
-        timeout_ms: this.deps.config.httpTimeoutMs,
-      });
-      let response;
+      let response: Awaited<ReturnType<OpenRouterClient['parseImageGenerationResponseBody']>>;
       let httpStatus: number;
       let receivedHttpStatus: number | null = null;
       try {
-        const result = await this.deps.client.generateImageWithStatus(
-          job.payload.requestBodies[callIndex]!,
-          (status, requestDurationMs) => {
-            receivedHttpStatus = status;
-            this.deps.queue.recordHttpStatus(job.id, status);
-            this.log({
-              event: 'http_response_received',
-              job_id: job.id,
-              request_id: job.requestId,
-              model: job.model,
-              http_status: status,
-              request_duration_ms: requestDurationMs,
-              phase: 'response_headers',
-              call_index: callIndex,
-            });
-          },
-        );
-        response = result.response;
-        httpStatus = result.status;
+        if (callState === 'response_preserved') {
+          const preserved = this.deps.queue.preservedResponse(job.id, callIndex);
+          if (!preserved)
+            throw new AppError('A resposta preservada não está disponível.', 'PRESERVED_RESPONSE_MISSING');
+          receivedHttpStatus = preserved.httpStatus;
+          response = this.deps.client.parseImageGenerationResponseBody(preserved.body);
+          httpStatus = preserved.httpStatus;
+          this.log({
+            event: 'local_response_recovery_started',
+            job_id: job.id,
+            request_id: job.requestId,
+            model: job.model,
+            http_status: preserved.httpStatus,
+            call_index: callIndex,
+            response_bytes: preserved.sizeBytes,
+            post_sent: false,
+          });
+        } else {
+          this.deps.queue.markCallPostStarted(job.id, callIndex);
+          this.log({
+            event: 'http_request_started',
+            job_id: job.id,
+            request_id: job.requestId,
+            model: job.model,
+            call_index: callIndex,
+            timeout_ms: this.deps.config.httpTimeoutMs,
+          });
+          const result = await this.deps.client.generateImageWithStatus(
+            job.payload.requestBodies[callIndex]!,
+            (status, requestDurationMs) => {
+              receivedHttpStatus = status;
+              this.deps.queue.recordHttpStatus(job.id, status);
+              this.log({
+                event: 'http_response_received',
+                job_id: job.id,
+                request_id: job.requestId,
+                model: job.model,
+                http_status: status,
+                request_duration_ms: requestDurationMs,
+                phase: 'response_headers',
+                call_index: callIndex,
+              });
+            },
+            (raw) => {
+              const saved = this.deps.queue.saveRawResponse(
+                job.id,
+                callIndex,
+                raw,
+                this.deps.config.maxRawResponseStorageBytes,
+              );
+              this.log({
+                event: 'raw_http_response_preserved',
+                job_id: job.id,
+                request_id: job.requestId,
+                model: job.model,
+                http_status: raw.status,
+                call_index: callIndex,
+                size_bytes: saved.sizeBytes,
+                sha256: saved.sha256,
+              });
+            },
+          );
+          response = result.response;
+          httpStatus = result.status;
+        }
       } catch (error) {
         const status = receivedHttpStatus ?? this.deps.queue.httpStatus(job.id) ?? responseStatus(error);
+        if (status === 200 && this.deps.queue.hasPreservedResponse(job.id, callIndex)) {
+          await this.accountInterpretationFailure(job, callIndex, error, status);
+        }
         const confirmed = this.deps.queue.confirmedCalls(job.id);
         if (httpErrorIsDefinitive(status) && confirmed.count > 0) {
           const actualCost = confirmed.allCostsKnown ? confirmed.totalCostUsd : null;
@@ -339,32 +604,20 @@ export class ImageJobWorker {
       }
       let outputs: PersistedImageOutput[];
       try {
-        outputs = toOutputs(job, response, this.deps.config.maxImageBytes);
+        outputs = toOutputs(job, response, this.deps.config.maxImageBytes, this.deps.imageDetector);
       } catch (error) {
-        const cost = typeof response.usage?.cost === 'number' ? response.usage.cost : null;
-        this.deps.queue.saveResponse(job.id, callIndex, [], cost, httpStatus);
-        const confirmed = this.deps.queue.confirmedCalls(job.id);
-        const actualCost = confirmed.allCostsKnown ? confirmed.totalCostUsd : null;
-        this.deps.queue.setActualCost(job.id, actualCost);
-        await this.deps.store.completePaidRequest(job.requestId, {
-          at: new Date().toISOString(),
-          model: job.model,
-          costUsd: actualCost,
-          budgetUsd: actualCost ?? job.payload.estimateUsd ?? 0,
-          unknownCost: actualCost === null,
-          operation: job.operation,
-          jobId: job.id,
-        });
-        this.deps.queue.setPhase(
-          job.id,
-          'cost_accounted',
-          'response_persisted',
-          actualCost === null ? 'cost_unknown' : 'accounted',
-        );
+        await this.accountInterpretationFailure(job, callIndex, error, httpStatus);
         throw error;
       }
       const cost = typeof response.usage?.cost === 'number' ? response.usage.cost : null;
-      this.deps.queue.saveResponse(job.id, callIndex, outputs, cost, httpStatus);
+      this.deps.queue.saveResponse(
+        job.id,
+        callIndex,
+        outputs,
+        cost,
+        httpStatus,
+        safeResponseMetadata(response),
+      );
       this.log({
         event: 'result_parsed_and_durably_stored',
         job_id: job.id,

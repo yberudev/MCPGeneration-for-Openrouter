@@ -43,6 +43,7 @@ const rawSchema = z.object({
   MAX_IMAGE_VARIATIONS: z.coerce.number().int().min(1).max(20).default(4),
   MAX_IMAGE_BYTES: z.coerce.number().int().positive().default(25_000_000),
   MAX_HTTP_RESPONSE_BYTES: z.coerce.number().int().positive().default(160_000_000),
+  MAX_RAW_RESPONSE_STORAGE_BYTES: z.coerce.number().int().positive().default(536_870_912),
   MAX_VIDEO_BYTES: z.coerce.number().int().positive().default(524_288_000),
   HTTP_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(600_000).default(120_000),
   VIDEO_POLL_INTERVAL_MS: z.coerce.number().int().min(1_000).max(300_000).default(30_000),
@@ -64,6 +65,7 @@ export interface AppConfig {
   maxImageVariations: number;
   maxImageBytes: number;
   maxHttpResponseBytes: number;
+  maxRawResponseStorageBytes: number;
   maxVideoBytes: number;
   httpTimeoutMs: number;
   videoPollIntervalMs: number;
@@ -129,6 +131,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxImageVariations: values.MAX_IMAGE_VARIATIONS,
     maxImageBytes: values.MAX_IMAGE_BYTES,
     maxHttpResponseBytes: values.MAX_HTTP_RESPONSE_BYTES,
+    maxRawResponseStorageBytes: values.MAX_RAW_RESPONSE_STORAGE_BYTES,
     maxVideoBytes: values.MAX_VIDEO_BYTES,
     httpTimeoutMs: values.HTTP_TIMEOUT_MS,
     videoPollIntervalMs: values.VIDEO_POLL_INTERVAL_MS,

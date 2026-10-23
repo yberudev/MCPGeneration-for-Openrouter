@@ -91,6 +91,62 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
     });
   }, 60_000);
 
+  it('uses live Gemini token ceilings and all five OpenRouter FLUX resolution prices', async () => {
+    await withLiveApp(async (client, requests) => {
+      const gemini = resultData<{
+        status: string;
+        kind: string;
+        estimateUsd: number | null;
+        sourceDate: string;
+        parameters: Record<string, unknown>;
+      }>(
+        await client.callTool({
+          name: 'estimate_cost',
+          arguments: {
+            type: 'image',
+            model: 'google/gemini-3.1-flash-lite-image',
+            operation: 'generate',
+            resolution: '1K',
+            aspect_ratio: '4:5',
+          },
+        }),
+      );
+      expect(gemini).toMatchObject({ status: 'estimated', kind: 'defensible_upper_bound', estimateUsd: 0.138457 });
+      expect(gemini.sourceDate).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(gemini.parameters).toMatchObject({
+        inputContextTokenLimit: 65_536,
+        maxCompletionTokens: 58_982,
+        imageOutputTokens: 1_120,
+      });
+
+      const prices = [
+        ['768', 0.041],
+        ['1K', 0.048],
+        ['1.5K', 0.07],
+        ['2K', 0.1],
+        ['4K', 0.607],
+      ] as const;
+      for (const [resolution, estimateUsd] of prices) {
+        const flux = resultData<{ status: string; kind: string; estimateUsd: number | null; parameters: Record<string, unknown> }>(
+          await client.callTool({
+            name: 'estimate_cost',
+            arguments: {
+              type: 'image',
+              model: 'black-forest-labs/flux-3-image',
+              operation: 'edit',
+              resolution,
+              reference_image_count: 1,
+            },
+          }),
+        );
+        expect(flux).toMatchObject({ status: 'estimated', kind: 'fixed_price', estimateUsd });
+        expect(flux.parameters).toMatchObject({ resolution, referenceCount: 1, unitPriceUsd: estimateUsd });
+      }
+      expect(requests.length).toBeGreaterThan(0);
+      expect(requests.every((method) => method === 'GET')).toBe(true);
+    });
+  }, 60_000);
+
   it('builds documented image, edit, video, and first-frame requests without any POST', async () => {
     await withLiveApp(async (client, requests, projectRoot) => {
       const imageBytes = Buffer.alloc(24);
@@ -103,7 +159,7 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
         const generated = resultData<{
           dry_run: boolean;
           request: Record<string, unknown>;
-          estimate: { status: string; estimateUsd: number | null };
+          estimate: { status: string; kind: string; estimateUsd: number | null; assumptions: string[] };
         }>(
           await client.callTool({
             name: 'generate_image',
@@ -123,7 +179,12 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
           aspect_ratio: '16:9',
           resolution: '1K',
         });
-        expect(generated.estimate.status).toBe('unknown');
+        expect(generated.estimate).toMatchObject({
+          status: 'estimated',
+          kind: 'defensible_upper_bound',
+          estimateUsd: 0.138457,
+        });
+        expect(generated.estimate.assumptions.length).toBeGreaterThan(0);
 
         const edited = resultData<{
           dry_run: boolean;
@@ -145,7 +206,7 @@ describe.skipIf(!enabled)('live OpenRouter catalogs and dry runs (GET only)', ()
         expect(edited.request.model).toBe('google/gemini-3.1-flash-image');
         expect(edited.request.input_references[0]).toMatchObject({
           type: 'image_url',
-          image_url: { url: expect.stringContaining('data URL image/png omitida') },
+          image_url: { url: '[base64 omitido; data URL image/png]' },
         });
 
         const video = resultData<{

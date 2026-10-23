@@ -6,7 +6,7 @@ import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotoc
 import { describe, expect, it } from 'vitest';
 
 describe('stdio process', () => {
-  it('completes MCP discovery over stdio and advertises all 15 tools without stdout noise', async () => {
+  it('completes MCP discovery over stdio and advertises all 16 tools without stdout noise', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'mcp-stdio-'));
     const environment = {
       ...getDefaultEnvironment(),
@@ -27,7 +27,7 @@ describe('stdio process', () => {
     try {
       await client.connect(transport);
       const result = await client.listTools();
-      expect(result.tools).toHaveLength(15);
+      expect(result.tools).toHaveLength(16);
       expect(stderr.join('')).not.toContain('OPENROUTER_API_KEY');
     } finally {
       await client.close();

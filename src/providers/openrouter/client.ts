@@ -39,6 +39,12 @@ export interface NetworkProbeResult {
   transport?: TransportDiagnostic;
 }
 
+export interface PreservedOpenRouterResponse {
+  status: number;
+  contentType: string | null;
+  body: Buffer;
+}
+
 export class OpenRouterClient {
   private readonly fetchImpl: typeof fetch;
   private readonly maxResponseBytes: number;
@@ -99,6 +105,7 @@ export class OpenRouterClient {
     requireApiKey = true,
     onResponse?: (response: Response, requestDurationMs: number) => void,
     sendApiKey = true,
+    onRawResponse?: (response: PreservedOpenRouterResponse) => void | Promise<void>,
   ): Promise<T> {
     const requestStarted = performance.now();
     const signal = init.signal ?? AbortSignal.timeout(this.options.timeoutMs);
@@ -191,8 +198,25 @@ export class OpenRouterClient {
         }
         chunks.push(Buffer.from(chunk.value));
       }
+      const rawBody = Buffer.concat(chunks, total);
+      if (onRawResponse) {
+        try {
+          await onRawResponse({
+            status: response.status,
+            contentType: response.headers.get('content-type'),
+            body: rawBody,
+          });
+        } catch (error) {
+          if (error instanceof AppError) throw error;
+          throw new AppError(
+            'A resposta HTTP recebida não pôde ser preservada no armazenamento local.',
+            'RAW_RESPONSE_PERSIST_ERROR',
+            { cause: error },
+          );
+        }
+      }
       try {
-        return JSON.parse(Buffer.concat(chunks, total).toString('utf8')) as T;
+        return JSON.parse(rawBody.toString('utf8')) as T;
       } catch (error) {
         throw new OpenRouterTransportError(
           'O OpenRouter devolveu um corpo que não é JSON válido.',
@@ -251,6 +275,13 @@ export class OpenRouterClient {
     return response.data.data as VideoModel[];
   }
 
+  async getModelEndpointDetails(id: string): Promise<unknown> {
+    const parts = id.split('/');
+    if (parts.length !== 2 || !parts.every((part) => /^[a-zA-Z0-9._-]+$/.test(part)))
+      throw new AppError('O catálogo devolveu um id de modelo inválido.', 'INVALID_CATALOG_MODEL_ID');
+    return this.requestJson<unknown>(`/models/${parts.map(encodeURIComponent).join('/')}/endpoints`, {}, false);
+  }
+
   async getImageModelEndpoints(path: string): Promise<unknown> {
     if (!path.startsWith('/api/v1/images/models/') || path.includes('..')) {
       throw new AppError('O catálogo devolveu um caminho de endpoint inválido.', 'INVALID_CATALOG_PATH');
@@ -265,6 +296,7 @@ export class OpenRouterClient {
   async generateImageWithStatus(
     body: OpenRouterImageRequest,
     onHttpResponse?: (status: number, requestDurationMs: number) => void,
+    onRawResponse?: (response: PreservedOpenRouterResponse) => void | Promise<void>,
   ): Promise<{ response: ImageGenerationResponse; status: number }> {
     let status = 0;
     const value = await this.requestJson<unknown>(
@@ -275,11 +307,28 @@ export class OpenRouterClient {
         status = response.status;
         onHttpResponse?.(response.status, requestDurationMs);
       },
+      true,
+      onRawResponse,
     );
     return {
       response: this.parseResponse(imageGenerationResponseSchema, value, 'imagem') as ImageGenerationResponse,
       status,
     };
+  }
+
+  parseImageGenerationResponseBody(body: Uint8Array): ImageGenerationResponse {
+    let value: unknown;
+    try {
+      value = JSON.parse(Buffer.from(body).toString('utf8')) as unknown;
+    } catch (error) {
+      throw new OpenRouterTransportError(
+        'A resposta preservada do OpenRouter não é JSON válido.',
+        'INVALID_RESPONSE',
+        error,
+        transportDiagnostic(error, 'response_parse', 0, undefined, 'invalid_json'),
+      );
+    }
+    return this.parseResponse(imageGenerationResponseSchema, value, 'imagem') as ImageGenerationResponse;
   }
 
   createVideo(body: OpenRouterVideoRequest): Promise<VideoJobResponse> {

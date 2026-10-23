@@ -8,6 +8,14 @@ export interface ImageModel {
   [key: string]: unknown;
 }
 
+export interface OpenRouterModelDetails {
+  id: string;
+  context_length?: number;
+  pricing?: Record<string, unknown>;
+  top_provider?: { context_length?: number; max_completion_tokens?: number };
+  [key: string]: unknown;
+}
+
 export interface VideoModel {
   id: string;
   name?: string;

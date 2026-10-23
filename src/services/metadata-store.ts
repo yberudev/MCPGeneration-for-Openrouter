@@ -265,24 +265,29 @@ export class MetadataStore {
       const requests = await this.readArray<PaidRequestRecord>(this.requestsPath);
       const sameId = requests.find((request) => request.id === args.id);
       if (sameId) {
-        if (sameId.fingerprint === args.fingerprint && sameId.state === 'pending') return;
-        throw new AppError(
-          'O identificador local já está associado a uma reserva diferente ou incerta.',
-          'PAID_REQUEST_ID_CONFLICT',
-        );
+        if (sameId.fingerprint === args.fingerprint && sameId.state === 'pending') {
+          // A worker may restart before post_started and refresh its catalog estimate.
+          // Revalidate the reservation atomically instead of retaining a stale amount.
+        } else {
+          throw new AppError(
+            'O identificador local já está associado a uma reserva diferente ou incerta.',
+            'PAID_REQUEST_ID_CONFLICT',
+          );
+        }
       }
+      const otherRequests = requests.filter((request) => request.id !== args.id);
       if (
-        requests.some(
+        otherRequests.some(
           (request) =>
             request.fingerprint === args.fingerprint && ['pending', 'uncertain'].includes(request.state),
         )
       ) {
         throw new AppError(
-          'Já existe uma tentativa idêntica em curso ou com resultado incerto. Consulte os jobs e a atividade OpenRouter antes de repetir; remova a entrada de requests.json apenas após reconciliação manual.',
+          'Já existe uma tentativa idêntica em curso ou com resultado incerto. Consulte os jobs e a atividade OpenRouter; use reconcile_image_job apenas com evidência verificada e não remova a reserva manualmente.',
           'DUPLICATE_UNCERTAIN_REQUEST',
         );
       }
-      if (usage.some((item) => item.unknownCost) || requests.some((item) => item.unknownCost)) {
+      if (usage.some((item) => item.unknownCost) || otherRequests.some((item) => item.unknownCost)) {
         throw new AppError(
           'O limite de gastos está suspenso porque existe uma operação de custo desconhecido por reconciliar.',
           'UNKNOWN_SPEND_REQUIRES_RECONCILIATION',
@@ -296,7 +301,7 @@ export class MetadataStore {
       }
       const committed =
         usage.reduce((sum, item) => sum + (item.budgetUsd ?? item.costUsd ?? 0), 0) +
-        requests.reduce((sum, item) => sum + item.budgetUsd, 0);
+        otherRequests.reduce((sum, item) => sum + item.budgetUsd, 0);
       if (
         committed >= args.maxTotalSpendUsd ||
         (!args.unknownCost && committed + args.budgetUsd > args.maxTotalSpendUsd)
@@ -306,15 +311,18 @@ export class MetadataStore {
           'TOTAL_SPEND_LIMIT',
         );
       }
-      requests.push({
+      const updatedRequest: PaidRequestRecord = {
         id: args.id,
         operation: args.operation,
         fingerprint: args.fingerprint,
-        createdAt: new Date().toISOString(),
+        createdAt: sameId?.createdAt ?? new Date().toISOString(),
         state: 'pending',
         budgetUsd: args.budgetUsd,
         unknownCost: args.unknownCost,
-      });
+      };
+      const sameIndex = requests.findIndex((request) => request.id === args.id);
+      if (sameIndex >= 0) requests[sameIndex] = updatedRequest;
+      else requests.push(updatedRequest);
       await this.writeArray(this.requestsPath, requests);
     });
   }

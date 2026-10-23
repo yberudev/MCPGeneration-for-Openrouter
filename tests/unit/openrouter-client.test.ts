@@ -55,6 +55,31 @@ describe('OpenRouterClient', () => {
     await expect(client.listVideoModels()).rejects.not.toThrow('sk-or-private');
   });
 
+  it('persists a successful HTTP body through the callback before schema interpretation', async () => {
+    const order: string[] = [];
+    const client = new OpenRouterClient({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'test-secret',
+      timeoutMs: 1_000,
+      fetchImpl: async () => new Response('{"data":{}}', { status: 200 }),
+    });
+    await expect(
+      client.generateImageWithStatus(
+        { model: 'example/image', prompt: 'private prompt' },
+        (status) => {
+          expect(status).toBe(200);
+          order.push('headers');
+        },
+        ({ status, body }) => {
+          expect(status).toBe(200);
+          expect(body.toString()).toBe('{"data":{}}');
+          order.push('durable_raw_body');
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    expect(order).toEqual(['headers', 'durable_raw_body']);
+  });
+
   it.each([
     [401, 'chave OpenRouter é inválida'],
     [402, 'créditos insuficientes'],

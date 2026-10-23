@@ -17,6 +17,7 @@ O servidor lê variáveis do processo. `dotenv` carrega `.env` da pasta de insta
 | `MAX_IMAGE_VARIATIONS`     | `4`                                        | Limite de quantidade nas ferramentas de imagem.                           |
 | `MAX_IMAGE_BYTES`          | `25000000`                                 | Tamanho máximo por imagem.                                                |
 | `MAX_HTTP_RESPONSE_BYTES`  | `160000000`                                | Limite para respostas JSON, incluindo imagens base64.                     |
+| `MAX_RAW_RESPONSE_STORAGE_BYTES` | `536870912`                           | Quota total de corpos HTTP 200 preservados para recuperação local.        |
 | `MAX_VIDEO_BYTES`          | `524288000`                                | Tamanho máximo de vídeo em download.                                      |
 | `HTTP_TIMEOUT_MS`          | `120000`                                   | Timeout HTTP.                                                             |
 | `VIDEO_POLL_INTERVAL_MS`   | `30000`                                    | Documentação para polling manual; não inicia um loop em fundo.            |
@@ -24,5 +25,7 @@ O servidor lê variáveis do processo. `dotenv` carrega `.env` da pasta de insta
 | `LOG_LEVEL`                | `info`                                     | Reservado para logging operacional; não altera a saída MCP.               |
 
 Uma variável em branco usa o padrão. A configuração é validada no arranque. O servidor não precisa de API key para iniciar nem para consultar os catálogos públicos por GET. Precisa dela para gerar conteúdo, consultar estado ou descarregar vídeo.
+
+O corpo HTTP 200 fica na base local protegida até a imagem ser interpretada e os bytes de saída estarem duráveis. Depois, o corpo é removido e ficam hash, tamanho e metadados estruturais sem prompt/base64. Se parsing falhar, o corpo permanece disponível para `recover_image_job_response`, até recuperar ou atingir a quota; não existe eliminação automática por idade.
 
 `RUN_PAID_TESTS` e `PAID_TEST_MAX_COST_USD` só se aplicam ao teste pago opcional; veja o README.

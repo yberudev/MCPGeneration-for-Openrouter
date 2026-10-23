@@ -23,6 +23,7 @@ O servidor usa MCP v2 e transporte `stdio`. Não inclui uma interface web nem ex
 | `start_image_edit_job` | Enfileira edição com `input_references` e devolve `job_id`.                    |
 | `get_image_job_status` | Consulta estado, fases, custo, erro e ficheiros guardados.                     |
 | `list_image_jobs`      | Lista jobs e reservas legadas sem as modificar.                                |
+| `recover_image_job_response` | Volta a interpretar localmente uma resposta/saída durável; nunca envia POST. |
 | `reconcile_image_job`  | Regista decisão financeira manual com evidência; nunca repete o POST.          |
 | `generate_image`       | Wrapper compatível: agora enfileira e devolve `job_id`.                        |
 | `edit_image`           | Wrapper compatível: agora enfileira e devolve `job_id`.                        |
@@ -31,7 +32,7 @@ O servidor usa MCP v2 e transporte `stdio`. Não inclui uma interface web nem ex
 | `animate_image`        | Envia uma imagem como primeiro frame, quando o modelo declara essa capacidade. |
 | `get_video_status`     | Consulta e persiste o estado de um job já submetido.                           |
 | `download_video`       | Descarrega uma tarefa concluída para uma raiz autorizada.                      |
-| `estimate_cost`        | Calcula uma estimativa com os metadados atuais ou devolve `unknown`.           |
+| `estimate_cost`        | Calcula preço fixo, limite superior, estimativa fundamentada ou `unknown`.     |
 | `list_assets`          | Lista metadados de recursos locais sem enviar conteúdo binário.                |
 
 ## Modelos iniciais
@@ -123,21 +124,26 @@ Por omissão, os recursos ficam em:
 
 `YBERU_ASSETS_DIR` altera o diretório de saída relativo ao projeto. `YBERU_PROJECT_ROOT` substitui a raiz detetada; `YBERU_ALLOWED_ROOTS` acrescenta outras raízes autorizadas, separadas pelo separador de caminhos do sistema (`:` no Linux/macOS). Um caminho absoluto passado a uma ferramenta só é aceite se estiver dentro de uma dessas raízes. O servidor rejeita directory traversal, symlinks de saída e colisões; nunca substitui ficheiros existentes.
 
-O estado local fica em `~/.local/share/mcp-generation-openrouter/` por omissão. `YBERU_DATA_DIR` define outra pasta absoluta e tem de ser igual para MCP e worker. O diretório guarda os metadados legados `jobs.json`, `assets.json`, `usage.json`, `requests.json` e a nova fila `image-jobs.sqlite` (WAL, diretório `0700`, base/sidecars `0600`). A fila contém payloads locais, prompts e imagens de entrada em base64 até à entrega; não são escritos nos logs. `requests.json` contém hashes e reservas, não imagens.
+O estado local fica em `~/.local/share/mcp-generation-openrouter/` por omissão. `YBERU_DATA_DIR` define outra pasta absoluta e tem de ser igual para MCP e worker. O diretório guarda os metadados legados `jobs.json`, `assets.json`, `usage.json`, `requests.json` e a nova fila `image-jobs.sqlite` (WAL, diretório `0700`, base/sidecars `0600`). A fila contém payloads locais, prompts e imagens de entrada em base64 até à entrega; não são escritos nos logs. Respostas HTTP 200 completas são preservadas na tabela privada `image_job_raw_responses` antes do parsing JSON/Zod/base64/MIME; a base SQLite fica com modo `0600`. Respostas interpretadas e outputs duráveis têm o corpo HTTP removido, mantendo hash, tamanho e metadados estruturais seguros. Respostas com falha de parsing ficam retidas até recuperação local; a quota total predefinida é 512 MiB e não há remoção por idade. `requests.json` contém hashes e reservas, não imagens.
 
 ## Custos e operações pagas
 
 - `allow_paid` começa em `false` em todas as ferramentas que geram conteúdo.
 - Os limites padrão são `$5` por operação e `$20` acumulados. Um valor passado em `max_cost_usd` não pode ultrapassar o limite global por operação.
-- O servidor consulta preços do catálogo. Algumas imagens são faturadas por tokens de saída; como o número de tokens do resultado não é conhecido antes da geração, a ferramenta devolve `unknown` e bloqueia a chamada por omissão.
-- `ALLOW_UNKNOWN_COST=true` é uma política explícita do operador. Permite uma única operação cuja estimativa não é verificável, mas não torna possível garantir um teto para esse pedido. Se o custo final também não vier na resposta, as próximas chamadas pagas ficam bloqueadas até reconciliação manual.
+- O servidor consulta preços atuais do catálogo OpenRouter e limites por fornecedor em `GET /api/v1/models/{model}/endpoints`. Catálogos incompletos ou contraditórios resultam em `unknown`; com `ALLOW_UNKNOWN_COST=false`, a geração continua bloqueada.
+- `google/gemini-3.1-flash-lite-image` tem estimativa quando o catálogo publica tarifas/limites suficientes: 1K usa 1.120 tokens de imagem de saída; o cálculo soma o máximo publicado de tokens de entrada e de conclusão aos tokens da imagem. Com os dados verificados em 23-10-2026, o limite superior é `$0.138457` por imagem (65536 × `$0.00000025` + 58982 × `$0.0000015` + 1120 × `$0.00003`). Referências ocupam o teto de entrada; `n.max=1`; variações multiplicam o limite por chamada. Se faltar qualquer dado, a estimativa volta a `unknown`.
+- `black-forest-labs/flux-3-image` seleciona `variant` da tarifa OpenRouter: 768 `$0.041`, 1K `$0.048`, 1.5K `$0.070`, 2K `$0.100`, 4K `$0.607`. Sem resolução usa o maior preço publicado como limite superior, nunca o primeiro da lista. Os preços coincidem com a tabela BFL.
+- `ALLOW_UNKNOWN_COST=true` continua a ser uma exceção explícita e não garante um teto absoluto; esta versão mantém `ALLOW_UNKNOWN_COST=false`.
+- `max_cost_usd` compara estimativa/limite superior com limites locais e reserva orçamento; **não limita a cobrança do fornecedor**. O custo real é lido da resposta e pode exceder a estimativa.
 - Vídeos usam as `pricing_skus` atuais quando existe uma tarifa compatível com a duração, resolução e referências. A estimativa não garante o custo final.
 - `dry_run=true` consulta capacidades e custos, mostra o payload API (com base64 omitido) e não cria job nem inicia geração.
-- Antes de cada POST, o servidor reserva a despesa e guarda um hash do pedido. Se o resultado de um POST ficar incerto por timeout ou falha 5xx, não repete o pedido; a reserva permanece para bloquear uma duplicação. Depois de confirmar a atividade no OpenRouter, reconcilie a entrada correspondente em `requests.json`/`usage.json` antes de remover uma reserva.
+- Antes de cada POST, o servidor reserva a despesa e guarda um hash do pedido. Se o resultado de um POST ficar incerto por timeout ou falha 5xx, não repete o pedido; a reserva permanece para bloquear uma duplicação. Use `reconcile_image_job` apenas com evidência verificada; não remova manualmente reservas incertas.
+
+As fórmulas atuais para Gemini 3.1 Flash Lite Image e FLUX 3 Image, os endpoints oficiais consultados, a distinção entre estimativa e limite superior e a preservação privada de respostas HTTP 200 estão descritos em [custos de imagem e recuperação local](docs/image-costing-and-response-recovery.md).
 
 As ferramentas de imagem agora devolvem rapidamente `job_id` e estado local `queued`; o worker reserva o orçamento antes do POST. Consulte `get_image_job_status` até `completed`, `failed`, `uncertain` ou `reconciliation_required`. `completed` só significa que todos os outputs esperados foram validados, guardados, verificados por hash e ligados aos metadados. Se o Claude fechar/cancelar a chamada MCP, o worker continua. Um estado `uncertain` bloqueia repetição automática. O `HTTP_TIMEOUT_MS` continua a limitar a chamada HTTP do worker, não o tempo de vida do job.
 
-Nenhuma chave ou chamada de geração paga é necessária para iniciar o processo ou descobrir ferramentas. As consultas GET públicas dos catálogos de modelos e preços não enviam a chave. Consultar estado de uma tarefa, gerar conteúdo ou descarregar vídeo requer autenticação.
+Nenhuma chamada de geração paga é necessária para iniciar o processo ou descobrir ferramentas. As consultas GET públicas dos catálogos de modelos e preços não enviam a chave. Consultar estado de uma tarefa, gerar conteúdo ou descarregar vídeo requer autenticação.
 
 ## Text-to-video e image-to-video
 
@@ -155,7 +161,7 @@ Os prompts e os padrões para personagem, edição, animação e homepage estão
 
 ## Testes
 
-`npm test` usa respostas HTTP simuladas e um cliente MCP de teste. Abrange descoberta de ferramentas, enqueue rápido com respostas simuladas de 75/150 segundos, encerramento do adaptador, retomada segura, incerteza sem retry, HTTP 400/5xx, ECONNRESET, JSON/tamanho inválido, falha de gravação, reconciliação, variações parciais, vídeo, limites, persistência, caminhos e sanitização dos logs. Inclui concorrência entre processos para reservas. Estes testes não chamam a API real nem consomem créditos.
+`npm test` usa respostas HTTP simuladas e um cliente MCP de teste. Abrange descoberta de ferramentas, enqueue rápido com respostas simuladas de 75/150 segundos, encerramento do adaptador, retomada segura, incerteza sem retry, HTTP 400/5xx, ECONNRESET, PNG/JPEG/WebP, JSON/esquema/base64/MIME inválido, preservação antes do parsing, custo após falha, recuperação sem segundo POST, quota/hash de respostas, falha de gravação, reconciliação, variações parciais, vídeo, limites, persistência, caminhos e sanitização dos logs. Fixtures do catálogo OpenRouter guardam as tarifas reais de Gemini e FLUX 3 obtidas por GET. Inclui concorrência entre processos para reservas. Estes testes não fazem gerações reais nem consomem créditos.
 
 `npm run test:catalog` consulta os catálogos e preços reais, verifica Nano Banana 2, Nano Banana 2 Lite e HeyGen Video e executa `dry_run` de geração, edição, vídeo e animação. O teste faz apenas GET e verifica que nenhum POST foi enviado; requer acesso à Internet, mas não uma API key nem créditos.
 
@@ -163,11 +169,11 @@ Existe um teste pago de uma imagem em `tests/paid/`. Só corre se as variáveis 
 
 ## Limitações conhecidas
 
-- O custo antecipado por imagem pode ser desconhecido quando o OpenRouter publica apenas preço por token.
+- O custo antecipado de modelos por token continua desconhecido quando faltam resolução, tarifas de entrada/saída ou limites máximos publicados. O catálogo pode mudar; a estimativa guardada identifica a observação usada na autorização.
 - Alguns fornecedores de vídeo não aceitam data URLs; use um URL HTTPS público quando a API do modelo o exigir.
 - O acompanhamento de vídeo continua a ser sob pedido, sem polling em segundo plano nem ferramenta de cancelamento. Jobs de imagem são executados em segundo plano pelo serviço local.
 - O worker só funciona enquanto o serviço `systemd --user` está instalado/ativo. O job fica persistido enquanto estiver parado.
-- Se o processo morrer após o início possível do POST e antes de persistir a resposta, o job fica `uncertain`. O OpenRouter publica metadados de geração, mas a API oficial de conteúdo da geração não garante recuperar os bytes de uma imagem em resposta síncrona; não prometemos recuperação de imagem perdida. A reconciliação financeira não reenvia o pedido.
+- Se o processo morrer após iniciar o POST mas antes de receber/preservar o corpo HTTP completo, o job fica `uncertain`; não há retry automático e não se garante recuperação pelo histórico OpenRouter. Depois de HTTP 200 e preservação local, falhas de interpretação podem ser recuperadas com `recover_image_job_response`, sem segundo POST. A recuperação depende da integridade local e da quota. A reconciliação financeira não reenvia o pedido.
 - Só são guardados vídeos cujo tipo MIME e assinatura básica sejam MP4 ou WebM.
 - A disponibilidade e os parâmetros de modelos mudam; `list_models` é a fonte atual.
 

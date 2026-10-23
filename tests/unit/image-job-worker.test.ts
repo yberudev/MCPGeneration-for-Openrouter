@@ -1,9 +1,10 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../../src/config/env.js';
 import { OpenRouterClient } from '../../src/providers/openrouter/client.js';
 import { AssetManager } from '../../src/services/asset-manager.js';
@@ -12,6 +13,7 @@ import { ImageJobQueue, type ImageJobPayload } from '../../src/services/image-jo
 import { ImageJobWorker } from '../../src/services/image-job-worker.js';
 import { MetadataStore } from '../../src/services/metadata-store.js';
 import type { OpenRouterImageRequest } from '../../src/types/openrouter.js';
+import type { ModelRegistry } from '../../src/services/model-registry.js';
 
 function pngBase64(): string {
   const png = Buffer.alloc(24);
@@ -22,13 +24,44 @@ function pngBase64(): string {
 }
 
 function imageResponse(cost: number | undefined = 0.04): Response {
+  return responseWithData([{ b64_json: pngBase64(), media_type: 'image/png' }], cost);
+}
+
+function responseWithData(data: unknown, cost: number | undefined = 0.04): Response {
   return Response.json({
-    data: [{ b64_json: pngBase64(), media_type: 'image/png' }],
+    data,
     ...(cost === undefined ? {} : { usage: { cost } }),
   });
 }
 
-async function fixture(fetchImpl?: typeof fetch, maxHttpResponseBytes = 160_000_000, enqueue = true) {
+function webpBase64(): string {
+  const webp = Buffer.alloc(30);
+  webp.write('RIFF', 0, 'ascii');
+  webp.writeUInt32LE(22, 4);
+  webp.write('WEBP', 8, 'ascii');
+  webp.write('VP8X', 12, 'ascii');
+  return webp.toString('base64');
+}
+
+function jpegBase64(): string {
+  const jpeg = Buffer.alloc(15);
+  jpeg[0] = 0xff;
+  jpeg[1] = 0xd8;
+  jpeg[2] = 0xff;
+  jpeg[3] = 0xc0;
+  jpeg.writeUInt16BE(11, 4);
+  jpeg[6] = 8;
+  jpeg.writeUInt16BE(1, 7);
+  jpeg.writeUInt16BE(1, 9);
+  return jpeg.toString('base64');
+}
+
+async function fixture(
+  fetchImpl?: typeof fetch,
+  maxHttpResponseBytes = 160_000_000,
+  enqueue = true,
+  maxCostPerRequestUsd = 5,
+) {
   const temp = await mkdtemp(join(tmpdir(), 'mcp-image-worker-'));
   const root = join(temp, 'project');
   const dataDir = join(temp, 'state');
@@ -36,7 +69,7 @@ async function fixture(fetchImpl?: typeof fetch, maxHttpResponseBytes = 160_000_
     OPENROUTER_API_KEY: 'test-secret-never-log',
     YBERU_PROJECT_ROOT: root,
     YBERU_DATA_DIR: dataDir,
-    MAX_COST_PER_REQUEST_USD: '5',
+    MAX_COST_PER_REQUEST_USD: String(maxCostPerRequestUsd),
     MAX_TOTAL_SPEND_USD: '20',
     MAX_HTTP_RESPONSE_BYTES: String(maxHttpResponseBytes),
   });
@@ -68,8 +101,8 @@ async function fixture(fetchImpl?: typeof fetch, maxHttpResponseBytes = 160_000_
     estimateUsd: 0.05,
     estimateSource: 'mock catalog',
     estimateUnknownCost: false,
-    maxCostUsd: 5,
-    maxCostPerRequestUsd: 5,
+    maxCostUsd: maxCostPerRequestUsd,
+    maxCostPerRequestUsd,
     maxTotalSpendUsd: 20,
     allowUnknownCost: false,
     expectedOutputCount: 1,
@@ -328,7 +361,6 @@ describe('durable image jobs and worker recovery', () => {
         throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
       },
     ],
-    ['JSON inválido', async () => new Response('{broken json', { status: 200 })],
     ['resposta demasiado grande', async () => new Response('x'.repeat(200), { status: 200 })],
   ])('%s fica incerto e não recebe retry', async (_label, postResponse) => {
     let posts = 0;
@@ -345,6 +377,386 @@ describe('durable image jobs and worker recovery', () => {
       expect((await f.store.paidRequest(f.jobId))?.state).toBe('uncertain');
       expect(await f.worker.runOne()).toBe(false);
       expect(posts).toBe(1);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('preserves a valid HTTP 200 body before parsing and clears only the body after durable output storage', async () => {
+    const f = await fixture(async () => imageResponse(0.04));
+    try {
+      await f.worker.runOne();
+      const capture = f.workerQueue.responseCapture(f.jobId);
+      expect(capture).toHaveLength(1);
+      expect(capture[0]).toMatchObject({
+        httpStatus: 200,
+        parseState: 'parsed',
+        bodyAvailable: false,
+        safeMetadata: {
+          jsonValid: true,
+          dataState: 'array',
+          dataCount: 1,
+          usageCostState: 'available',
+          usageCostUsd: 0.04,
+        },
+      });
+      const events = f.workerQueue.events(f.jobId).map((event) => event.event);
+      expect(events.indexOf('raw_http_response_durably_preserved')).toBeLessThan(
+        events.indexOf('response_outputs_durably_stored'),
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('detects a corrupted preserved response before local recovery', async () => {
+    const f = await fixture();
+    try {
+      f.adapterQueue.claimNext();
+      f.adapterQueue.markCallPostStarted(f.jobId, 0);
+      f.adapterQueue.saveRawResponse(
+        f.jobId,
+        0,
+        { status: 200, contentType: 'application/json', body: Buffer.from('{"data":[]}') },
+        f.config.maxRawResponseStorageBytes,
+      );
+      const db = new DatabaseSync(f.workerQueue.databasePath);
+      try {
+        db.prepare('UPDATE image_job_raw_responses SET body=? WHERE job_id=?').run(Buffer.from('corrupt'), f.jobId);
+      } finally {
+        db.close();
+      }
+      expect(() => f.workerQueue.preservedResponse(f.jobId, 0)).toThrow(
+        expect.objectContaining({ code: 'PRESERVED_RESPONSE_CORRUPT' }),
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('rolls back the response-preservation transaction when the database rejects the insert', async () => {
+    const f = await fixture();
+    try {
+      f.adapterQueue.claimNext();
+      f.adapterQueue.markCallPostStarted(f.jobId, 0);
+      expect(() =>
+        f.adapterQueue.saveRawResponse(
+          'missing-job-id',
+          0,
+          { status: 200, contentType: 'application/json', body: Buffer.from('{"data":[]}') },
+          f.config.maxRawResponseStorageBytes,
+        ),
+      ).toThrow();
+      expect(f.workerQueue.responseCapture(f.jobId)).toEqual([]);
+      expect(f.workerQueue.callState(f.jobId, 0)).toBe('post_started');
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('keeps an unrecoverable reconciliation-required record unchanged when local recovery has no body', async () => {
+    const f = await fixture();
+    try {
+      f.adapterQueue.claimNext();
+      f.adapterQueue.markCallPostStarted(f.jobId, 0);
+      f.adapterQueue.uncertain(f.jobId, 'NETWORK_ERROR', 'simulated test record', null);
+      f.adapterQueue.reconcile(f.jobId, 'confirm_charged', 'verified local test evidence', 0.05);
+      const beforeJob = f.workerQueue.get(f.jobId);
+      const beforeEvents = f.workerQueue.events(f.jobId);
+      expect(() => f.workerQueue.recoverPreservedResponse(f.jobId)).toThrow(
+        expect.objectContaining({ code: 'PRESERVED_RESPONSE_MISSING' }),
+      );
+      expect(f.workerQueue.get(f.jobId)).toEqual(beforeJob);
+      expect(f.workerQueue.events(f.jobId)).toEqual(beforeEvents);
+      expect(f.workerQueue.responseCapture(f.jobId)).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('keeps a paid response uncertain and never retries when durable response storage fails', async () => {
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') posts += 1;
+      return imageResponse(0.1);
+    });
+    const storage = vi.spyOn(f.workerQueue, 'saveRawResponse').mockImplementation(() => {
+      throw new Error('simulated disk failure; never log response body');
+    });
+    try {
+      await f.worker.runOne();
+      expect(posts).toBe(1);
+      expect(f.workerQueue.get(f.jobId)).toMatchObject({
+        status: 'uncertain',
+        errorCode: 'RAW_RESPONSE_PERSIST_ERROR',
+        actualCostUsd: null,
+      });
+      expect(f.workerQueue.responseCapture(f.jobId)).toEqual([]);
+      expect((await f.store.paidRequest(f.jobId))?.state).toBe('uncertain');
+      expect(await f.worker.runOne()).toBe(false);
+      expect(posts).toBe(1);
+      expect(JSON.stringify(f.logs)).not.toContain('simulated disk failure');
+      expect(JSON.stringify(f.logs)).not.toContain(pngBase64());
+    } finally {
+      storage.mockRestore();
+      await f.close();
+    }
+  });
+
+  it('recovers a preserved response after worker restart without sending a second POST', async () => {
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') posts += 1;
+      return imageResponse(0.04);
+    });
+    try {
+      const raw = JSON.stringify({
+        data: [{ b64_json: pngBase64(), media_type: 'image/png' }],
+        usage: { cost: 0.04 },
+      });
+      f.adapterQueue.claimNext();
+      f.adapterQueue.markCallPostStarted(f.jobId, 0);
+      f.adapterQueue.saveRawResponse(
+        f.jobId,
+        0,
+        { status: 200, contentType: 'application/json', body: Buffer.from(raw) },
+        f.config.maxRawResponseStorageBytes,
+      );
+      f.adapterQueue.close();
+      await f.worker.recover();
+      expect(f.workerQueue.get(f.jobId)?.status).toBe('queued');
+      await f.worker.runOne();
+      expect(posts).toBe(0);
+      expect(f.workerQueue.get(f.jobId)?.status).toBe('completed');
+      expect(f.workerQueue.get(f.jobId)?.actualCostUsd).toBe(0.04);
+      const usage = JSON.parse(await readFile(f.store.usagePath, 'utf8')) as Array<{ jobId: string }>;
+      expect(usage.filter((item) => item.jobId === f.jobId)).toHaveLength(1);
+      expect(f.workerQueue.responseCapture(f.jobId)[0]?.bodyAvailable).toBe(false);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('accounts a higher reported charge than the estimate without losing the actual cost', async () => {
+    const f = await fixture(async () => imageResponse(0.1));
+    try {
+      await f.worker.runOne();
+      expect(f.workerQueue.get(f.jobId)?.status).toBe('completed');
+      expect(f.workerQueue.get(f.jobId)?.estimateUsd).toBe(0.05);
+      expect(f.workerQueue.get(f.jobId)?.actualCostUsd).toBe(0.1);
+      expect((await f.store.usageForJob(f.jobId))?.costUsd).toBe(0.1);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('refreshes Gemini pricing before reserving and before the first paid POST', async () => {
+    let releaseResponse!: () => void;
+    let notifyStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') {
+        posts += 1;
+        notifyStarted();
+        await gate;
+        return imageResponse(0.04);
+      }
+      throw new Error('Unexpected network request in mocked registry test');
+    }, 160_000_000, true, 1);
+    const registry = {
+      image: async () => ({
+        id: 'google/gemini-3.1-flash-lite-image',
+        supported_parameters: {
+          resolution: { type: 'enum', values: ['1K'] },
+          input_references: { type: 'range', min: 0, max: 14 },
+        },
+      }),
+      imagePricing: async () => [{ billable: 'output_image', unit: 'token', cost_usd: 0.00003 }],
+      modelDetails: async () => ({
+        id: 'google/gemini-3.1-flash-lite-image',
+        context_length: 65_536,
+        pricing: { prompt: 0.00000025, completion: 0.0000015, image_output: 0.00003 },
+        top_provider: { context_length: 65_536, max_completion_tokens: 58_982 },
+      }),
+    } as unknown as ModelRegistry;
+    try {
+      const worker = new ImageJobWorker({
+        config: f.config,
+        client: f.client,
+        registry,
+        assets: f.assets,
+        costs: f.costs,
+        store: f.store,
+        queue: f.workerQueue,
+        logger: (entry) => f.logs.push(entry),
+      });
+      const running = worker.runOne();
+      await started;
+      expect(await f.store.paidRequest(f.jobId)).toMatchObject({ state: 'pending', budgetUsd: 0.138457 });
+      expect(f.workerQueue.get(f.jobId)?.estimateUsd).toBe(0.138457);
+      releaseResponse();
+      await running;
+      expect(posts).toBe(1);
+      expect(f.workerQueue.get(f.jobId)?.status).toBe('completed');
+      expect(f.workerQueue.get(f.jobId)?.estimateUsd).toBe(0.138457);
+      expect(f.workerQueue.get(f.jobId)?.actualCostUsd).toBe(0.04);
+    } finally {
+      releaseResponse();
+      await f.close();
+    }
+  });
+
+  it('blocks before POST when the freshly fetched Gemini upper bound exceeds max_cost_usd', async () => {
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') posts += 1;
+      return imageResponse(0.04);
+    }, 160_000_000, true, 0.05);
+    const registry = {
+      image: async () => ({
+        id: 'google/gemini-3.1-flash-lite-image',
+        supported_parameters: {
+          resolution: { type: 'enum', values: ['1K'] },
+          input_references: { type: 'range', min: 0, max: 14 },
+        },
+      }),
+      imagePricing: async () => [{ billable: 'output_image', unit: 'token', cost_usd: 0.00003 }],
+      modelDetails: async () => ({
+        id: 'google/gemini-3.1-flash-lite-image',
+        context_length: 65_536,
+        pricing: { prompt: 0.00000025, completion: 0.0000015, image_output: 0.00003 },
+        top_provider: { context_length: 65_536, max_completion_tokens: 58_982 },
+      }),
+    } as unknown as ModelRegistry;
+    try {
+      const worker = new ImageJobWorker({
+        config: f.config,
+        client: f.client,
+        registry,
+        assets: f.assets,
+        costs: f.costs,
+        store: f.store,
+        queue: f.workerQueue,
+        logger: (entry) => f.logs.push(entry),
+      });
+      await worker.runOne();
+      expect(f.workerQueue.get(f.jobId)?.status).toBe('failed');
+      expect(f.workerQueue.get(f.jobId)?.errorCode).toBe('REQUEST_COST_LIMIT');
+      expect(f.workerQueue.get(f.jobId)?.estimateUsd).toBe(0.138457);
+      expect(await f.store.paidRequests()).toEqual([]);
+      expect(posts).toBe(0);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
+    ['PNG', Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, ...new Array(16).fill(0)]), 'image/png', '.png'],
+    ['JPEG', Buffer.from(jpegBase64(), 'base64'), 'image/jpeg', '.jpg'],
+    ['WebP', Buffer.from(webpBase64(), 'base64'), 'image/webp', '.webp'],
+  ])('accepts a signature-verified %s image response', async (_name, bytes, mediaType, extension) => {
+    const f = await fixture(async () =>
+      responseWithData([{ b64_json: bytes.toString('base64'), media_type: mediaType }], 0.04),
+    );
+    try {
+      await f.worker.runOne();
+      const job = f.workerQueue.get(f.jobId);
+      expect(job?.status).toBe('completed');
+      expect(job?.files[0]).toMatch(new RegExp(`${extension.replace('.', '\\.')}$`));
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
+    ['invalid JSON', () => new Response('{broken json', { status: 200 }), 'INVALID_RESPONSE', null],
+    ['missing data', () => responseWithData(undefined, 0.1), 'IMAGE_RESPONSE_DATA_MISSING', 0.1],
+    ['empty data', () => responseWithData([], 0.1), 'IMAGE_RESPONSE_EMPTY', 0.1],
+    ['missing base64', () => responseWithData([{ media_type: 'image/png' }], 0.1), 'IMAGE_DATA_MISSING', 0.1],
+    ['invalid base64', () => responseWithData([{ b64_json: '%%%not-base64%%%' }], 0.1), 'INVALID_BASE64', 0.1],
+    ['invalid image signature', () => responseWithData([{ b64_json: Buffer.from('not-image').toString('base64') }], 0.1), 'INVALID_IMAGE_FORMAT', 0.1],
+    ['incorrect media type', () => responseWithData([{ b64_json: pngBase64(), media_type: 'image/jpeg' }], 0.1), 'IMAGE_MIME_MISMATCH', 0.1],
+  ])('%s response is retained and its financial state is not reported as zero', async (_name, getResponse, errorCode, cost) => {
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') posts += 1;
+      return getResponse();
+    });
+    try {
+      await f.worker.runOne();
+      const job = f.workerQueue.get(f.jobId);
+      expect(job?.status).toBe('reconciliation_required');
+      expect(job?.errorCode).toBe(errorCode);
+      expect(job?.actualCostUsd).toBe(cost);
+      expect(job?.financialState).toBe(cost === null ? 'cost_unknown' : 'accounted');
+      expect(f.workerQueue.responseCapture(f.jobId)[0]).toMatchObject({
+        parseState: 'parse_failed',
+        bodyAvailable: true,
+      });
+      const usage = await f.store.usageForJob(f.jobId);
+      expect(usage?.costUsd).toBe(cost);
+      if (cost === null) expect(usage?.unknownCost).toBe(true);
+      expect(await f.worker.runOne()).toBe(false);
+      expect(posts).toBe(1);
+      expect(JSON.stringify(f.logs)).not.toContain(pngBase64());
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('preserves a response and actual cost when the image detector throws unexpectedly', async () => {
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') posts += 1;
+      return imageResponse(0.1);
+    });
+    try {
+      const worker = new ImageJobWorker({
+        config: f.config,
+        client: f.client,
+        assets: f.assets,
+        costs: f.costs,
+        store: f.store,
+        queue: f.workerQueue,
+        imageDetector: () => {
+          throw new Error('secret prompt and base64 must not enter logs');
+        },
+        logger: (entry) => f.logs.push(entry),
+      });
+      await worker.runOne();
+      const job = f.workerQueue.get(f.jobId);
+      expect(job?.status).toBe('reconciliation_required');
+      expect(job?.errorCode).toBe('WORKER_ERROR');
+      expect(job?.actualCostUsd).toBe(0.1);
+      expect(f.workerQueue.responseCapture(f.jobId)[0]?.bodyAvailable).toBe(true);
+      expect(posts).toBe(1);
+      expect(JSON.stringify(f.logs)).not.toContain('secret prompt');
+      expect(JSON.stringify(f.logs)).not.toContain(pngBase64());
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('does not repeat a paid POST when the raw response storage quota is exhausted', async () => {
+    let posts = 0;
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') posts += 1;
+      return imageResponse(0.1);
+    });
+    try {
+      f.config.maxRawResponseStorageBytes = 1;
+      await f.worker.runOne();
+      expect(f.workerQueue.get(f.jobId)?.status).toBe('uncertain');
+      expect(f.workerQueue.get(f.jobId)?.errorCode).toBe('RAW_RESPONSE_STORAGE_LIMIT');
+      expect(posts).toBe(1);
+      expect(f.workerQueue.responseCapture(f.jobId)).toEqual([]);
+      expect(await f.worker.runOne()).toBe(false);
     } finally {
       await f.close();
     }

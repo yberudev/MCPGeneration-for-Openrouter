@@ -113,14 +113,23 @@ async function estimateImage(
   model: ImageModel,
   count: number,
   operation: 'generate' | 'edit' | 'variation',
+  options: { resolution?: string; aspectRatio?: string; referenceCount?: number } = {},
 ) {
   let pricing: unknown;
+  let modelDetails;
   try {
     pricing = await deps.registry.imagePricing(model);
   } catch {
     /* CostGuard reports unknown. */
   }
-  return deps.costs.imageEstimate(model, pricing, count, operation);
+  if (model.id === 'google/gemini-3.1-flash-lite-image') {
+    try {
+      modelDetails = await deps.registry.modelDetails(model.id);
+    } catch {
+      /* CostGuard reports unknown if a live upper-bound input is unavailable. */
+    }
+  }
+  return deps.costs.imageEstimate(model, pricing, count, operation, { ...options, modelDetails });
 }
 
 function requestBody(
@@ -166,6 +175,7 @@ function publicJob(job: ReturnType<ImageJobQueue['get']>) {
     created_at: job.createdAt,
     updated_at: job.updatedAt,
     estimate_usd: job.estimateUsd,
+    estimate: job.payload.estimateDetails,
     cost_usd: job.actualCostUsd,
     http_status: job.httpStatus,
     error_code: job.errorCode,
@@ -183,6 +193,7 @@ function outputJobResult(job: ReturnType<ImageJobQueue['get']>, duplicate: boole
     status: job!.status,
     model: job!.model,
     estimate_usd: job!.estimateUsd,
+    estimate: job!.payload.estimateDetails,
     cost_reservation: 'worker reserves the budget atomically before the paid POST',
     message:
       'Job persistido localmente. O worker independente executará a geração; consulte get_image_job_status.',
@@ -197,6 +208,7 @@ async function enqueue(
     ImageJobPayload,
     | 'estimateUsd'
     | 'estimateSource'
+    | 'estimateDetails'
     | 'estimateUnknownCost'
     | 'maxCostUsd'
     | 'maxCostPerRequestUsd'
@@ -219,6 +231,7 @@ async function enqueue(
       resolvedOutputDir: output.directory,
       estimateUsd: estimate.estimateUsd,
       estimateSource: estimate.source,
+      estimateDetails: estimate,
       estimateUnknownCost: estimate.estimateUsd === null,
       maxCostUsd: args.max_cost_usd ?? deps.config.maxCostPerRequestUsd,
       maxCostPerRequestUsd: deps.config.maxCostPerRequestUsd,
@@ -249,7 +262,10 @@ export function registerImageTools(server: McpServer, deps: ImageDeps): void {
         size: args.size,
         n: args.n,
       });
-      const estimate = await estimateImage(deps, model, args.n, 'generate');
+      const estimate = await estimateImage(deps, model, args.n, 'generate', {
+        resolution: args.resolution,
+        aspectRatio: args.aspect_ratio,
+      });
       const body = requestBody(model.id, args.prompt, {
         ...args,
         ...(capability(model, 'n') ? { n: args.n } : {}),
@@ -309,7 +325,11 @@ export function registerImageTools(server: McpServer, deps: ImageDeps): void {
         size: args.size,
         references: 1,
       });
-      const estimate = await estimateImage(deps, model, 1, 'edit');
+      const estimate = await estimateImage(deps, model, 1, 'edit', {
+        resolution: args.resolution,
+        aspectRatio: args.aspect_ratio,
+        referenceCount: 1,
+      });
       const body = requestBody(model.id, args.prompt, { ...args, reference: input.dataUrl });
       if (args.dry_run)
         return {
@@ -383,7 +403,11 @@ export function registerImageTools(server: McpServer, deps: ImageDeps): void {
         n: perCallCount,
         references: input ? 1 : undefined,
       });
-      const estimate = await estimateImage(deps, model, args.count, 'variation');
+      const estimate = await estimateImage(deps, model, args.count, 'variation', {
+        resolution: args.resolution,
+        aspectRatio: args.aspect_ratio,
+        referenceCount: input ? 1 : 0,
+      });
       const callCount = perCallCount === args.count ? 1 : args.count;
       const bodies = Array.from({ length: callCount }, (_, call) =>
         requestBody(
@@ -462,7 +486,12 @@ export function registerImageTools(server: McpServer, deps: ImageDeps): void {
       safely(async () => {
         const job = deps.imageQueue.get(job_id);
         if (!job) throw new AppError('Job de imagem não encontrado.', 'IMAGE_JOB_NOT_FOUND');
-        return { success: true, job: publicJob(job), events: deps.imageQueue.events(job_id) };
+        return {
+          success: true,
+          job: publicJob(job),
+          response_capture: deps.imageQueue.responseCapture(job_id),
+          events: deps.imageQueue.events(job_id),
+        };
       }),
   );
 
@@ -491,6 +520,26 @@ export function registerImageTools(server: McpServer, deps: ImageDeps): void {
           unknown_cost: request.unknownCost,
         }));
         return { success: true, count: jobs.length, jobs, legacy_paid_requests: legacyRequests };
+      }),
+  );
+
+  server.registerTool(
+    'recover_image_job_response',
+    {
+      description:
+        'Volta a interpretar localmente uma resposta HTTP 200 preservada e tenta entregar os ficheiros. Só relê dados locais; nunca envia outro POST ao OpenRouter.',
+      inputSchema: z.object({ job_id: z.string().uuid() }),
+    },
+    async ({ job_id }) =>
+      safely(async () => {
+        deps.imageQueue.recoverPreservedResponse(job_id);
+        return {
+          success: true,
+          accepted: true,
+          job_id,
+          network_post: false,
+          message: 'Recuperação local enfileirada. O worker vai reler a resposta preservada sem gerar novamente.',
+        };
       }),
   );
 

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { AppError, sanitizeErrorMessage } from '../utils/errors.js';
 import type { OpenRouterImageRequest } from '../types/openrouter.js';
+import type { CostEstimate } from './cost-guard.js';
 
 export type ImageJobStatus =
   'queued' | 'running' | 'completed' | 'failed' | 'uncertain' | 'reconciliation_required';
@@ -22,6 +23,7 @@ export interface ImageJobPayload {
   relatedAssetId?: string;
   estimateUsd: number | null;
   estimateSource: string;
+  estimateDetails?: CostEstimate;
   estimateUnknownCost: boolean;
   maxCostUsd: number;
   maxCostPerRequestUsd: number;
@@ -35,6 +37,18 @@ export interface PersistedImageOutput {
   mimeType: string;
   bytes: Buffer;
   sha256: string;
+}
+
+export interface PreservedImageResponse {
+  jobId: string;
+  callIndex: number;
+  httpStatus: number;
+  contentType: string | null;
+  sha256: string;
+  sizeBytes: number;
+  body: Buffer;
+  parseState: 'preserved' | 'parse_failed';
+  safeMetadata: Record<string, unknown>;
 }
 
 export interface ImageJob {
@@ -138,6 +152,19 @@ export class ImageJobQueue {
         state TEXT NOT NULL,
         actual_cost_usd REAL,
         http_status INTEGER,
+        PRIMARY KEY(job_id, call_index)
+      );
+      CREATE TABLE IF NOT EXISTS image_job_raw_responses (
+        job_id TEXT NOT NULL REFERENCES image_jobs(id),
+        call_index INTEGER NOT NULL,
+        http_status INTEGER NOT NULL,
+        content_type TEXT,
+        sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        body BLOB,
+        parse_state TEXT NOT NULL CHECK(parse_state IN ('preserved', 'parse_failed', 'parsed')),
+        safe_metadata_json TEXT NOT NULL DEFAULT '{}',
+        received_at TEXT NOT NULL,
         PRIMARY KEY(job_id, call_index)
       );
       CREATE TABLE IF NOT EXISTS image_job_events (
@@ -259,7 +286,15 @@ export class ImageJobQueue {
         const unfinishedPost = this.db
           .prepare("SELECT 1 FROM image_job_calls WHERE job_id=? AND state='post_started' LIMIT 1")
           .get(String(row.id));
-        if (phase === 'post_started' || unfinishedPost) {
+        const preservedResponse = this.db
+          .prepare("SELECT 1 FROM image_job_calls WHERE job_id=? AND state='response_preserved' LIMIT 1")
+          .get(String(row.id));
+        if (preservedResponse && !unfinishedPost) {
+          this.db
+            .prepare("UPDATE image_jobs SET status='queued', phase='response_preserved', updated_at=? WHERE id=?")
+            .run(now, id);
+          this.event(id, 'response_preserved', 'worker_restart_resume_local_parse');
+        } else if (phase === 'post_started' || unfinishedPost) {
           uncertainIds.push(id);
           this.db
             .prepare(
@@ -316,6 +351,33 @@ export class ImageJobQueue {
     });
   }
 
+  updateEstimate(jobId: string, estimate: CostEstimate): void {
+    this.transaction(() => {
+      const row = this.db.prepare('SELECT status, phase, payload_json FROM image_jobs WHERE id=?').get(jobId) as
+        | { status: string; phase: string; payload_json: string }
+        | undefined;
+      if (!row) throw new AppError('Job de imagem inexistente.', 'IMAGE_JOB_NOT_FOUND');
+      if (row.status !== 'running' || row.phase === 'post_started')
+        throw new AppError('A estimativa só pode ser atualizada antes do POST pago.', 'COST_ESTIMATE_ALREADY_FROZEN');
+      const payload = JSON.parse(row.payload_json) as ImageJobPayload;
+      const previousEstimateUsd = payload.estimateUsd;
+      payload.estimateUsd = estimate.estimateUsd;
+      payload.estimateSource = estimate.source;
+      payload.estimateDetails = estimate;
+      payload.estimateUnknownCost = estimate.estimateUsd === null;
+      this.db
+        .prepare('UPDATE image_jobs SET estimate_usd=?, payload_json=?, updated_at=? WHERE id=?')
+        .run(estimate.estimateUsd, JSON.stringify(payload), new Date().toISOString(), jobId);
+      this.event(jobId, row.phase, 'live_cost_estimate_refreshed_before_reservation', {
+        previousEstimateUsd,
+        estimateUsd: estimate.estimateUsd,
+        estimateKind: estimate.kind ?? (estimate.estimateUsd === null ? 'unknown' : 'grounded_estimate'),
+        source: estimate.source,
+        sourceDate: estimate.sourceDate ?? null,
+      });
+    });
+  }
+
   callState(jobId: string, callIndex: number): string | undefined {
     const row = this.db
       .prepare('SELECT state FROM image_job_calls WHERE job_id=? AND call_index=?')
@@ -359,6 +421,7 @@ export class ImageJobQueue {
     outputs: PersistedImageOutput[],
     actualCostUsd: number | null,
     httpStatus = 200,
+    safeMetadata: Record<string, unknown> = {},
   ): void {
     this.transaction(() => {
       const exists = this.db.prepare('SELECT id FROM image_jobs WHERE id=?').get(jobId);
@@ -375,6 +438,12 @@ export class ImageJobQueue {
            ON CONFLICT(job_id, call_index) DO UPDATE SET state='response_received', actual_cost_usd=excluded.actual_cost_usd, http_status=excluded.http_status`,
         )
         .run(jobId, callIndex, actualCostUsd, httpStatus);
+      this.db
+        .prepare(
+          `UPDATE image_job_raw_responses SET body=NULL, parse_state='parsed', safe_metadata_json=?
+           WHERE job_id=? AND call_index=?`,
+        )
+        .run(JSON.stringify(safeMetadata), jobId, callIndex);
       const costRow = this.db
         .prepare(
           'SELECT COUNT(*) AS count, SUM(actual_cost_usd) AS total, SUM(actual_cost_usd IS NULL) AS missing FROM image_job_calls WHERE job_id=?',
@@ -405,6 +474,228 @@ export class ImageJobQueue {
         callIndex,
         httpStatus,
         outputBytes: outputs.reduce((sum, output) => sum + output.bytes.length, 0),
+        safeMetadata,
+      });
+    });
+  }
+
+  saveRawResponse(
+    jobId: string,
+    callIndex: number,
+    response: { status: number; contentType: string | null; body: Buffer },
+    maxTotalBytes: number,
+  ): { sha256: string; sizeBytes: number } {
+    if (response.status !== 200)
+      throw new AppError('Só respostas HTTP 200 de geração podem ser preservadas.', 'INVALID_RAW_RESPONSE_STATUS');
+    if (!response.body.length)
+      throw new AppError('A resposta HTTP 200 está vazia e não pode ser preservada.', 'RAW_RESPONSE_EMPTY');
+    const sha256 = createHash('sha256').update(response.body).digest('hex');
+    const sizeBytes = response.body.length;
+    this.transaction(() => {
+      const existing = this.db
+        .prepare('SELECT sha256, size_bytes FROM image_job_raw_responses WHERE job_id=? AND call_index=?')
+        .get(jobId, callIndex) as { sha256: string; size_bytes: number } | undefined;
+      if (existing) {
+        if (existing.sha256 !== sha256 || Number(existing.size_bytes) !== sizeBytes)
+          throw new AppError(
+            'Já existe uma resposta preservada diferente para esta chamada; os dados existentes foram mantidos.',
+            'PRESERVED_RESPONSE_CONFLICT',
+          );
+        return;
+      }
+      const stored = this.db
+        .prepare('SELECT COALESCE(SUM(length(body)), 0) AS bytes FROM image_job_raw_responses WHERE body IS NOT NULL')
+        .get() as { bytes: number };
+      if (Number(stored.bytes) + sizeBytes > maxTotalBytes)
+        throw new AppError(
+          `A preservação ultrapassaria MAX_RAW_RESPONSE_STORAGE_BYTES (${maxTotalBytes}).`,
+          'RAW_RESPONSE_STORAGE_LIMIT',
+        );
+      const now = new Date().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO image_job_raw_responses
+           (job_id, call_index, http_status, content_type, sha256, size_bytes, body, parse_state, safe_metadata_json, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'preserved', ?, ?)`,
+        )
+        .run(
+          jobId,
+          callIndex,
+          response.status,
+          response.contentType,
+          sha256,
+          sizeBytes,
+          response.body,
+          JSON.stringify({ bodyBytes: sizeBytes, contentType: response.contentType }),
+          now,
+        );
+      this.db
+        .prepare(
+          `INSERT INTO image_job_calls(job_id, call_index, state, http_status)
+           VALUES (?, ?, 'response_preserved', ?)
+           ON CONFLICT(job_id, call_index) DO UPDATE SET state='response_preserved', http_status=excluded.http_status`,
+        )
+        .run(jobId, callIndex, response.status);
+      this.db
+        .prepare(
+          `UPDATE image_jobs SET phase='response_preserved', delivery_state='response_preserved',
+           http_status=?, response_received_at=?, updated_at=? WHERE id=?`,
+        )
+        .run(response.status, now, now, jobId);
+      this.event(jobId, 'response_preserved', 'raw_http_response_durably_preserved', {
+        callIndex,
+        httpStatus: response.status,
+        contentType: response.contentType,
+        sizeBytes,
+        sha256,
+      });
+    });
+    return { sha256, sizeBytes };
+  }
+
+  preservedResponse(jobId: string, callIndex: number): PreservedImageResponse | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT job_id, call_index, http_status, content_type, sha256, size_bytes, body, parse_state, safe_metadata_json
+         FROM image_job_raw_responses WHERE job_id=? AND call_index=?`,
+      )
+      .get(jobId, callIndex) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    if (row.body === null || row.body === undefined)
+      throw new AppError('O corpo preservado já foi removido após parsing concluído.', 'PRESERVED_RESPONSE_BODY_UNAVAILABLE');
+    const body = Buffer.from(row.body as Uint8Array);
+    const sha256 = createHash('sha256').update(body).digest('hex');
+    if (body.length !== Number(row.size_bytes) || sha256 !== String(row.sha256))
+      throw new AppError('A integridade da resposta HTTP preservada falhou.', 'PRESERVED_RESPONSE_CORRUPT');
+    return {
+      jobId: String(row.job_id),
+      callIndex: Number(row.call_index),
+      httpStatus: Number(row.http_status),
+      contentType: row.content_type === null ? null : String(row.content_type),
+      sha256,
+      sizeBytes: body.length,
+      body,
+      parseState: String(row.parse_state) as 'preserved' | 'parse_failed',
+      safeMetadata: JSON.parse(String(row.safe_metadata_json)) as Record<string, unknown>,
+    };
+  }
+
+  hasPreservedResponse(jobId: string, callIndex: number): boolean {
+    const row = this.db
+      .prepare('SELECT 1 FROM image_job_raw_responses WHERE job_id=? AND call_index=? AND body IS NOT NULL')
+      .get(jobId, callIndex);
+    return row !== undefined;
+  }
+
+  responseCapture(jobId: string): Array<Record<string, unknown>> {
+    return (
+      this.db
+        .prepare(
+          `SELECT call_index, http_status, content_type, sha256, size_bytes, parse_state, safe_metadata_json, received_at,
+           body IS NOT NULL AS body_available
+           FROM image_job_raw_responses WHERE job_id=? ORDER BY call_index`,
+        )
+        .all(jobId) as Array<Record<string, unknown>>
+    ).map((row) => ({
+      callIndex: Number(row.call_index),
+      httpStatus: Number(row.http_status),
+      contentType: row.content_type === null ? null : String(row.content_type),
+      sha256: String(row.sha256),
+      sizeBytes: Number(row.size_bytes),
+      parseState: String(row.parse_state),
+      safeMetadata: JSON.parse(String(row.safe_metadata_json)) as Record<string, unknown>,
+      receivedAt: String(row.received_at),
+      bodyAvailable: Boolean(row.body_available),
+    }));
+  }
+
+  markResponseInterpretationFailed(
+    jobId: string,
+    callIndex: number,
+    actualCostUsd: number | null,
+    httpStatus: number,
+    safeMetadata: Record<string, unknown>,
+    errorCode: string,
+  ): void {
+    this.transaction(() => {
+      const raw = this.db
+        .prepare('SELECT body FROM image_job_raw_responses WHERE job_id=? AND call_index=?')
+        .get(jobId, callIndex) as { body: Uint8Array | null } | undefined;
+      if (!raw?.body)
+        throw new AppError('Não existe resposta íntegra para registar a falha de interpretação.', 'PRESERVED_RESPONSE_MISSING');
+      this.db
+        .prepare(
+          `UPDATE image_job_raw_responses SET parse_state='parse_failed', safe_metadata_json=?
+           WHERE job_id=? AND call_index=?`,
+        )
+        .run(JSON.stringify(safeMetadata), jobId, callIndex);
+      this.db
+        .prepare(
+          `INSERT INTO image_job_calls(job_id, call_index, state, actual_cost_usd, http_status)
+           VALUES (?, ?, 'response_preserved', ?, ?)
+           ON CONFLICT(job_id, call_index) DO UPDATE SET state='response_preserved', actual_cost_usd=excluded.actual_cost_usd, http_status=excluded.http_status`,
+        )
+        .run(jobId, callIndex, actualCostUsd, httpStatus);
+      const costRow = this.db
+        .prepare(
+          `SELECT COUNT(*) AS count, SUM(actual_cost_usd) AS total, SUM(actual_cost_usd IS NULL) AS missing
+           FROM image_job_calls WHERE job_id=? AND state IN ('response_received', 'response_preserved')`,
+        )
+        .get(jobId) as { count: number; total: number | null; missing: number };
+      this.db
+        .prepare(
+          `UPDATE image_jobs SET phase='response_preserved', delivery_state='interpretation_failed',
+           actual_cost_usd=?, http_status=?, error_code=?, updated_at=? WHERE id=?`,
+        )
+        .run(
+          costRow.count > 0 && costRow.missing === 0 ? costRow.total : null,
+          httpStatus,
+          errorCode.slice(0, 100),
+          new Date().toISOString(),
+          jobId,
+        );
+      this.event(jobId, 'interpretation_failed', 'response_preserved_but_not_interpreted', {
+        callIndex,
+        httpStatus,
+        actualCostKnown: actualCostUsd !== null,
+        errorCode: errorCode.slice(0, 100),
+        safeMetadata,
+      });
+    });
+  }
+
+  recoverPreservedResponse(jobId: string): void {
+    this.transaction(() => {
+      const job = this.db.prepare('SELECT status, payload_json FROM image_jobs WHERE id=?').get(jobId) as
+        | { status: string; payload_json: string }
+        | undefined;
+      if (!job) throw new AppError('Job de imagem inexistente.', 'IMAGE_JOB_NOT_FOUND');
+      if (job.status !== 'reconciliation_required')
+        throw new AppError('A recuperação local só é permitida em jobs reconciliation_required.', 'IMAGE_JOB_NOT_RECOVERABLE');
+      const raw = this.db
+        .prepare('SELECT 1 FROM image_job_raw_responses WHERE job_id=? AND body IS NOT NULL LIMIT 1')
+        .get(jobId);
+      const payload = JSON.parse(job.payload_json) as ImageJobPayload;
+      const storedOutputs = this.db
+        .prepare('SELECT COUNT(*) AS count FROM image_job_outputs WHERE job_id=?')
+        .get(jobId) as { count: number };
+      const receivedCalls = this.db
+        .prepare("SELECT COUNT(*) AS count FROM image_job_calls WHERE job_id=? AND state='response_received'")
+        .get(jobId) as { count: number };
+      const outputsCanResume =
+        Number(storedOutputs.count) >= payload.expectedOutputCount &&
+        Number(receivedCalls.count) === payload.requestBodies.length;
+      if (!raw && !outputsCanResume)
+        throw new AppError('Este job não tem uma resposta ou ficheiros preservados recuperáveis; nenhum POST será enviado.', 'PRESERVED_RESPONSE_MISSING');
+      const phase = outputsCanResume ? 'cost_accounted' : 'response_preserved';
+      this.db
+        .prepare(
+          `UPDATE image_jobs SET status='queued', phase=?, delivery_state=?,
+           error_code=NULL, error_message=NULL, updated_at=? WHERE id=?`,
+        )
+        .run(phase, outputsCanResume ? 'files_persisted' : 'response_preserved', new Date().toISOString(), jobId);
+      this.event(jobId, phase, 'operator_requested_local_response_recovery', {
+        networkPost: false,
       });
     });
   }
@@ -438,7 +729,7 @@ export class ImageJobQueue {
   confirmedCalls(jobId: string): { count: number; totalCostUsd: number; allCostsKnown: boolean } {
     const row = this.db
       .prepare(
-        "SELECT COUNT(*) AS count, COALESCE(SUM(actual_cost_usd), 0) AS total, SUM(actual_cost_usd IS NULL) AS missing FROM image_job_calls WHERE job_id=? AND state='response_received'",
+        "SELECT COUNT(*) AS count, COALESCE(SUM(actual_cost_usd), 0) AS total, SUM(actual_cost_usd IS NULL) AS missing FROM image_job_calls WHERE job_id=? AND state IN ('response_received', 'response_preserved')",
       )
       .get(jobId) as { count: number; total: number; missing: number | null };
     return {

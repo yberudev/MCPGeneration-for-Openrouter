@@ -29,6 +29,36 @@ function imageCatalog() {
   };
 }
 
+function geminiImagePricing() {
+  return Response.json({
+    endpoints: [
+      {
+        pricing: [{ billable: 'output_image', unit: 'token', cost_usd: 0.00003 }],
+      },
+    ],
+  });
+}
+
+function geminiModelEndpointDetails() {
+  return Response.json({
+    data: {
+      endpoints: [
+        {
+          context_length: 65_536,
+          max_completion_tokens: 58_982,
+          pricing: { prompt: 0.00000025, completion: 0.0000015, image_output: 0.00003 },
+        },
+      ],
+    },
+  });
+}
+
+function answerGeminiPricingGet(url: string): Response | undefined {
+  if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints')) return geminiImagePricing();
+  if (url.endsWith('/models/google/gemini-3.1-flash-lite-image/endpoints')) return geminiModelEndpointDetails();
+  return undefined;
+}
+
 function videoCatalog(includeConfigurableAudio = false) {
   return {
     data: [
@@ -150,7 +180,7 @@ async function waitForImageJob(client: Client, jobId: string) {
 }
 
 describe('MCP tool integration with mocked OpenRouter responses', () => {
-  it('performs handshake and advertises all 15 tools', async () => {
+  it('performs handshake and advertises all 16 tools', async () => {
     await withMcp(
       async () => new Response('{}'),
       async (client) => {
@@ -169,6 +199,7 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
           'list_image_jobs',
           'list_models',
           'reconcile_image_job',
+          'recover_image_job_response',
           'start_image_edit_job',
           'start_image_job',
         ]);
@@ -190,8 +221,8 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
       const fetchMock: typeof fetch = async (input, init) => {
         const url = String(input);
         if (url.endsWith('/images/models')) return Response.json(imageCatalog());
-        if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints'))
-          return Response.json({ endpoints: [{ pricing: [{ unit: 'image', cost_usd: '0.05' }] }] });
+        const geminiPricing = answerGeminiPricingGet(url);
+        if (geminiPricing) return geminiPricing;
         if (url.endsWith('/images') && init?.method === 'POST') {
           notifyPostStarted();
           await responseGate;
@@ -267,8 +298,8 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
     const fetchMock: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith('/images/models')) return Response.json(imageCatalog());
-      if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints'))
-        return Response.json({ endpoints: [{ pricing: [{ unit: 'image', cost_usd: '0.05' }] }] });
+      const geminiPricing = answerGeminiPricingGet(url);
+      if (geminiPricing) return geminiPricing;
       if (url.endsWith('/images') && init?.method === 'POST') posts += 1;
       throw new Error(`Unexpected request: ${url}`);
     };
@@ -307,11 +338,8 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
       const headers = new Headers(init?.headers);
       if (headers.get('authorization') === 'Bearer test-secret') sawAuth = true;
       if (url.endsWith('/images/models')) return Response.json(imageCatalog());
-      if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints')) {
-        return Response.json({
-          endpoints: [{ pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0.05 }] }],
-        });
-      }
+      const geminiPricing = answerGeminiPricingGet(url);
+      if (geminiPricing) return geminiPricing;
       if (url.endsWith('/images') && init?.method === 'POST') {
         return Response.json({
           data: [{ b64_json: pngData(), media_type: 'image/png' }],
@@ -360,11 +388,8 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
     const fetchMock: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith('/images/models')) return Response.json(imageCatalog());
-      if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints')) {
-        return Response.json({
-          endpoints: [{ pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0.05 }] }],
-        });
-      }
+      const geminiPricing = answerGeminiPricingGet(url);
+      if (geminiPricing) return geminiPricing;
       if (url.endsWith('/images') && init?.method === 'POST') {
         sentBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
         return Response.json({
@@ -431,7 +456,7 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
         name: 'estimate_cost',
         arguments: { type: 'image', model: 'google/gemini-3.1-flash-lite-image', operation: 'generate' },
       });
-      expect((estimate.structuredContent as { estimateUsd: number }).estimateUsd).toBe(0.05);
+      expect((estimate.structuredContent as { estimateUsd: number }).estimateUsd).toBe(0.138457);
     });
   });
 
@@ -440,11 +465,8 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
     const fetchMock: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith('/images/models')) return Response.json(imageCatalog());
-      if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints')) {
-        return Response.json({
-          endpoints: [{ pricing: [{ billable: 'output_image', unit: 'image', cost_usd: 0.05 }] }],
-        });
-      }
+      const geminiPricing = answerGeminiPricingGet(url);
+      if (geminiPricing) return geminiPricing;
       if (url.endsWith('/images') && init?.method === 'POST') {
         posts += 1;
         if (posts === 1) return Response.json({ data: [{ b64_json: pngData() }], usage: { cost: 0.04 } });
