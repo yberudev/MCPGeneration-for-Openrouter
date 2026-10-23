@@ -1,33 +1,38 @@
 # MCPGeneration for OpenRouter
 
-Servidor MCP local, em TypeScript, que liga clientes como Claude Code à API multimodal do OpenRouter. Expõe ferramentas para descobrir modelos, gerar e editar imagens, criar variações, iniciar tarefas de vídeo, acompanhar o estado e guardar os ficheiros num projeto local.
+Servidor MCP local, em TypeScript, que liga clientes como Claude Desktop/Code à API multimodal do OpenRouter. A geração de imagens é enfileirada numa base SQLite durável e executada por um worker Node independente do transporte MCP; vídeo mantém o fluxo existente.
 
 O servidor usa MCP v2 e transporte `stdio`. Não inclui uma interface web nem executa um agente autónomo. O cliente MCP decide quando chamar as ferramentas e como integrar os recursos no código do projeto.
 
 ## Funcionalidades
 
 - Catálogos atuais de modelos e capacidades publicados pelo OpenRouter.
-- Geração, edição e variações de imagens pelo endpoint dedicado `/images`.
+- Geração, edição e variações de imagens pelo endpoint dedicado `/images`, através de jobs duráveis.
 - Geração assíncrona de vídeo, animação de primeiro frame, consulta de estado e download autenticado por streaming.
 - Limites de custo, autorização `allow_paid`, modo `dry_run` e registo local de uso.
-- Persistência de jobs após reinício do processo.
+- Fila local SQLite/WAL, deduplicação, recuperação conservadora após reinício e estado de entrega separado do estado financeiro.
 - Gravação de imagens e vídeos dentro de raízes autorizadas, sem sobrescrever ficheiros existentes.
 - Respostas MCP com conteúdo legível e `structuredContent`.
 
 ## Ferramentas MCP
 
-| Ferramenta            | Utilização                                                                     |
-| --------------------- | ------------------------------------------------------------------------------ |
-| `list_models`         | Pesquisa capacidades verificadas nos catálogos de imagem e vídeo.              |
-| `generate_image`      | Gera uma ou mais imagens e guarda os resultados.                               |
-| `edit_image`          | Edita uma imagem local através de `input_references`.                          |
-| `generate_variations` | Produz um conjunto limitado de variações com nomes numerados.                  |
-| `generate_video`      | Inicia uma tarefa text-to-video e devolve os IDs local e remoto.               |
-| `animate_image`       | Envia uma imagem como primeiro frame, quando o modelo declara essa capacidade. |
-| `get_video_status`    | Consulta e persiste o estado de um job já submetido.                           |
-| `download_video`      | Descarrega uma tarefa concluída para uma raiz autorizada.                      |
-| `estimate_cost`       | Calcula uma estimativa com os metadados atuais ou devolve `unknown`.           |
-| `list_assets`         | Lista metadados de recursos locais sem enviar conteúdo binário.                |
+| Ferramenta             | Utilização                                                                     |
+| ---------------------- | ------------------------------------------------------------------------------ |
+| `list_models`          | Pesquisa capacidades verificadas nos catálogos de imagem e vídeo.              |
+| `start_image_job`      | Enfileira uma geração e devolve `job_id` sem esperar pela resposta paga.       |
+| `start_image_edit_job` | Enfileira edição com `input_references` e devolve `job_id`.                    |
+| `get_image_job_status` | Consulta estado, fases, custo, erro e ficheiros guardados.                     |
+| `list_image_jobs`      | Lista jobs e reservas legadas sem as modificar.                                |
+| `reconcile_image_job`  | Regista decisão financeira manual com evidência; nunca repete o POST.          |
+| `generate_image`       | Wrapper compatível: agora enfileira e devolve `job_id`.                        |
+| `edit_image`           | Wrapper compatível: agora enfileira e devolve `job_id`.                        |
+| `generate_variations`  | Wrapper compatível: enfileira o conjunto como job durável.                     |
+| `generate_video`       | Inicia uma tarefa text-to-video e devolve os IDs local e remoto.               |
+| `animate_image`        | Envia uma imagem como primeiro frame, quando o modelo declara essa capacidade. |
+| `get_video_status`     | Consulta e persiste o estado de um job já submetido.                           |
+| `download_video`       | Descarrega uma tarefa concluída para uma raiz autorizada.                      |
+| `estimate_cost`        | Calcula uma estimativa com os metadados atuais ou devolve `unknown`.           |
+| `list_assets`          | Lista metadados de recursos locais sem enviar conteúdo binário.                |
 
 ## Modelos iniciais
 
@@ -37,12 +42,12 @@ O servidor valida proporções, resoluções, durações, áudio, entrada de ref
 
 ## Requisitos
 
-- Node.js 20.19 ou superior.
+- Node.js 24 ou superior (usa `node:sqlite` integrado, sem dependência SQLite nativa externa).
 - npm.
 - Uma chave OpenRouter para consultar catálogos ou fazer pedidos à API.
 - Claude Code ou outro cliente MCP que suporte servidores locais `stdio`.
 
-O SDK MCP instalado é `@modelcontextprotocol/server` v2.3.1. A linha v2 do SDK requer Node.js 20 ou superior e usa `serveStdio` de `@modelcontextprotocol/server/stdio`.
+O SDK MCP instalado é `@modelcontextprotocol/server` v2.3.1. O runtime do MCP e o worker têm de usar o mesmo diretório de dados; o worker corre como serviço `systemd --user` no Linux.
 
 ## Instalação e configuração
 
@@ -53,7 +58,7 @@ npm ci
 cp .env.example .env
 ```
 
-Edite `.env` e configure `OPENROUTER_API_KEY`. O ficheiro `.env` está ignorado pelo Git. O servidor carrega o `.env` da sua própria pasta de instalação, mesmo quando Claude Code o inicia com o diretório de outro projeto como `cwd`. O ambiente do processo tem prioridade; uma entrada `.mcp.json` versionada não deve conter uma chave literal.
+Configure a chave OpenRouter num ficheiro fora do repositório, `~/.config/mcp-generation/worker.env`, com permissões `0600`. O MCP e o worker também aceitam variáveis herdadas pelo processo. O carregamento não depende do projeto que Claude abriu; não guarde a chave num `.mcp.json` versionado. `.env` continua disponível para configuração de desenvolvimento e está ignorado pelo Git.
 
 ```bash
 npm run build
@@ -61,6 +66,16 @@ npm run typecheck
 npm run lint
 npm test
 ```
+
+No Linux, instale e inicie o worker de imagens depois de colocar a chave no ficheiro externo. O script compila, cria cópias datadas dos JSON financeiros/metadados e instala um serviço `systemd --user`:
+
+```bash
+scripts/worker/prepare-env.sh
+scripts/worker/install-systemd-user.sh
+scripts/worker/verify.sh
+```
+
+`prepare-env.sh` move a variável de `.env` para o ficheiro externo, quando necessário, preserva uma cópia com permissões restritas e nunca mostra o valor. Se não existir uma chave local, crie `~/.config/mcp-generation/worker.env` com `OPENROUTER_API_KEY=<a sua chave>` e modo `0600`. Consulte [operação e recuperação do worker](docs/image-jobs-linux.md).
 
 Inicie o servidor localmente com `npm start`. Num terminal, o processo fica à espera de um cliente MCP; a saída padrão é reservada ao protocolo.
 
@@ -106,7 +121,7 @@ Por omissão, os recursos ficam em:
 
 `YBERU_ASSETS_DIR` altera o diretório de saída relativo ao projeto. `YBERU_PROJECT_ROOT` substitui a raiz detetada; `YBERU_ALLOWED_ROOTS` acrescenta outras raízes autorizadas, separadas pelo separador de caminhos do sistema (`:` no Linux/macOS). Um caminho absoluto passado a uma ferramenta só é aceite se estiver dentro de uma dessas raízes. O servidor rejeita directory traversal, symlinks de saída e colisões; nunca substitui ficheiros existentes.
 
-O estado local fica em `~/.local/share/mcp-generation-openrouter/` por omissão. `YBERU_DATA_DIR` define outra pasta absoluta. O diretório guarda `jobs.json`, `assets.json`, `usage.json` e `requests.json`; as imagens não são guardadas em base64 nesses registos. `requests.json` contém hashes e reservas, não prompts nem conteúdo de imagem.
+O estado local fica em `~/.local/share/mcp-generation-openrouter/` por omissão. `YBERU_DATA_DIR` define outra pasta absoluta e tem de ser igual para MCP e worker. O diretório guarda os metadados legados `jobs.json`, `assets.json`, `usage.json`, `requests.json` e a nova fila `image-jobs.sqlite` (WAL, diretório `0700`, base/sidecars `0600`). A fila contém payloads locais, prompts e imagens de entrada em base64 até à entrega; não são escritos nos logs. `requests.json` contém hashes e reservas, não imagens.
 
 ## Custos e operações pagas
 
@@ -115,8 +130,10 @@ O estado local fica em `~/.local/share/mcp-generation-openrouter/` por omissão.
 - O servidor consulta preços do catálogo. Algumas imagens são faturadas por tokens de saída; como o número de tokens do resultado não é conhecido antes da geração, a ferramenta devolve `unknown` e bloqueia a chamada por omissão.
 - `ALLOW_UNKNOWN_COST=true` é uma política explícita do operador. Permite uma única operação cuja estimativa não é verificável, mas não torna possível garantir um teto para esse pedido. Se o custo final também não vier na resposta, as próximas chamadas pagas ficam bloqueadas até reconciliação manual.
 - Vídeos usam as `pricing_skus` atuais quando existe uma tarifa compatível com a duração, resolução e referências. A estimativa não garante o custo final.
-- `dry_run=true` consulta capacidades e custos, mas não inicia uma geração.
+- `dry_run=true` consulta capacidades e custos, mostra o payload API (com base64 omitido) e não cria job nem inicia geração.
 - Antes de cada POST, o servidor reserva a despesa e guarda um hash do pedido. Se o resultado de um POST ficar incerto por timeout ou falha 5xx, não repete o pedido; a reserva permanece para bloquear uma duplicação. Depois de confirmar a atividade no OpenRouter, reconcilie a entrada correspondente em `requests.json`/`usage.json` antes de remover uma reserva.
+
+As ferramentas de imagem agora devolvem rapidamente `job_id` e estado local `queued`; o worker reserva o orçamento antes do POST. Consulte `get_image_job_status` até `completed`, `failed`, `uncertain` ou `reconciliation_required`. `completed` só significa que todos os outputs esperados foram validados, guardados, verificados por hash e ligados aos metadados. Se o Claude fechar/cancelar a chamada MCP, o worker continua. Um estado `uncertain` bloqueia repetição automática. O `HTTP_TIMEOUT_MS` continua a limitar a chamada HTTP do worker, não o tempo de vida do job.
 
 Nenhuma chave ou chamada de geração paga é necessária para iniciar o processo ou descobrir ferramentas. As consultas GET públicas dos catálogos de modelos e preços não enviam a chave. Consultar estado de uma tarefa, gerar conteúdo ou descarregar vídeo requer autenticação.
 
@@ -136,7 +153,7 @@ Os prompts e os padrões para personagem, edição, animação e homepage estão
 
 ## Testes
 
-`npm test` usa respostas HTTP simuladas e um cliente MCP de teste. Abrange descoberta de ferramentas, geração/edição/variações, submissão e recuperação de jobs, download interrompido, limites, persistência, deteção de formato e restrições de caminhos. Inclui um teste com dois processos concorrentes que tenta reservar o mesmo orçamento. Estes testes não usam uma API key nem consomem créditos.
+`npm test` usa respostas HTTP simuladas e um cliente MCP de teste. Abrange descoberta de ferramentas, enqueue rápido com respostas simuladas de 75/150 segundos, encerramento do adaptador, retomada segura, incerteza sem retry, HTTP 400/5xx, ECONNRESET, JSON/tamanho inválido, falha de gravação, reconciliação, variações parciais, vídeo, limites, persistência, caminhos e sanitização dos logs. Inclui concorrência entre processos para reservas. Estes testes não chamam a API real nem consomem créditos.
 
 `npm run test:catalog` consulta os catálogos e preços reais, verifica Nano Banana 2, Nano Banana 2 Lite e HeyGen Video e executa `dry_run` de geração, edição, vídeo e animação. O teste faz apenas GET e verifica que nenhum POST foi enviado; requer acesso à Internet, mas não uma API key nem créditos.
 
@@ -146,7 +163,9 @@ Existe um teste pago de uma imagem em `tests/paid/`. Só corre se as variáveis 
 
 - O custo antecipado por imagem pode ser desconhecido quando o OpenRouter publica apenas preço por token.
 - Alguns fornecedores de vídeo não aceitam data URLs; use um URL HTTPS público quando a API do modelo o exigir.
-- O acompanhamento é sob pedido, sem polling em segundo plano e sem ferramenta de cancelamento.
+- O acompanhamento de vídeo continua a ser sob pedido, sem polling em segundo plano nem ferramenta de cancelamento. Jobs de imagem são executados em segundo plano pelo serviço local.
+- O worker só funciona enquanto o serviço `systemd --user` está instalado/ativo. O job fica persistido enquanto estiver parado.
+- Se o processo morrer após o início possível do POST e antes de persistir a resposta, o job fica `uncertain`. O OpenRouter publica metadados de geração, mas a API oficial de conteúdo da geração não garante recuperar os bytes de uma imagem em resposta síncrona; não prometemos recuperação de imagem perdida. A reconciliação financeira não reenvia o pedido.
 - Só são guardados vídeos cujo tipo MIME e assinatura básica sejam MP4 ou WebM.
 - A disponibilidade e os parâmetros de modelos mudam; `list_models` é a fonte atual.
 

@@ -6,6 +6,7 @@ import { AssetManager } from './services/asset-manager.js';
 import { CostGuard } from './services/cost-guard.js';
 import { JobManager } from './services/job-manager.js';
 import { MetadataStore } from './services/metadata-store.js';
+import { ImageJobQueue } from './services/image-job-queue.js';
 import { ModelRegistry } from './services/model-registry.js';
 import { registerCatalogTools } from './tools/catalog-tools.js';
 import { registerImageTools } from './tools/image-tools.js';
@@ -20,11 +21,14 @@ export interface AppServices {
   costs: CostGuard;
   jobs: JobManager;
   store: MetadataStore;
+  imageQueue: ImageJobQueue;
 }
 
 export async function createApp(config: AppConfig, fetchImpl?: typeof fetch): Promise<AppServices> {
   const store = new MetadataStore(config.dataDir);
   await store.init();
+  const imageQueue = new ImageJobQueue(config.dataDir);
+  await imageQueue.init();
   const client = new OpenRouterClient({
     baseUrl: config.baseUrl,
     ...(config.apiKey ? { apiKey: config.apiKey } : {}),
@@ -38,7 +42,7 @@ export async function createApp(config: AppConfig, fetchImpl?: typeof fetch): Pr
   const jobs = new JobManager(store);
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
   registerCatalogTools(server, { config, registry, assets, costs });
-  registerImageTools(server, { config, client, registry, assets, costs, store });
+  registerImageTools(server, { config, client, registry, assets, costs, store, imageQueue });
   registerVideoTools(server, { config, client, registry, assets, costs, jobs, store });
-  return { server, config, client, registry, assets, costs, jobs, store };
+  return { server, config, client, registry, assets, costs, jobs, store, imageQueue };
 }

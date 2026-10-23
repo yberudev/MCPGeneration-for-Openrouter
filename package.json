@@ -1,12 +1,13 @@
 {
   "name": "mcp-generation-openrouter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local MCP server for image and video generation through OpenRouter",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:image-worker": "node dist/image-worker.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:catalog": "RUN_LIVE_CATALOG_TESTS=true vitest run tests/live",
@@ -20,7 +21,7 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=24.0.0"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.1",

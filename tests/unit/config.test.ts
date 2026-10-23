@@ -28,6 +28,9 @@ describe('loadConfig', () => {
   it('loads the server installation .env when Claude starts it from another project', async () => {
     const serverRoot = await mkdtemp(join(tmpdir(), 'mcp-server-env-'));
     const projectRoot = await mkdtemp(join(tmpdir(), 'mcp-active-project-'));
+    const externalConfig = join(serverRoot, 'user-config', 'worker.env');
+    await (await import('node:fs/promises')).mkdir(join(serverRoot, 'user-config'), { recursive: true });
+    await writeFile(externalConfig, 'OPENROUTER_API_KEY=external-worker-key\n');
     await writeFile(join(serverRoot, '.env'), 'OPENROUTER_API_KEY=server-installation-key\n');
     const previousKey = process.env.OPENROUTER_API_KEY;
     const previousCwd = process.cwd();
@@ -37,8 +40,8 @@ describe('loadConfig', () => {
       const installedEnvModule = pathToFileURL(join(serverRoot, 'dist', 'config', 'env.js')).href;
       const resolvedServerRoot = resolveServerRoot(installedEnvModule);
       expect(resolvedServerRoot).toBe(serverRoot);
-      loadServerEnvironment(resolvedServerRoot);
-      expect(loadConfig().apiKey).toBe('server-installation-key');
+      loadServerEnvironment(resolvedServerRoot, externalConfig);
+      expect(loadConfig().apiKey).toBe('external-worker-key');
     } finally {
       process.chdir(previousCwd);
       if (previousKey === undefined) delete process.env.OPENROUTER_API_KEY;

@@ -6,6 +6,8 @@ import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/env.js';
 import { createApp } from '../../src/server.js';
+import { ImageJobQueue } from '../../src/services/image-job-queue.js';
+import { ImageJobWorker } from '../../src/services/image-job-worker.js';
 
 function imageCatalog() {
   return {
@@ -77,7 +79,13 @@ function pngData() {
 
 async function withMcp(
   fetchImpl: typeof fetch,
-  test: (client: Client, root: string, dir: string) => Promise<void>,
+  test: (
+    client: Client,
+    root: string,
+    dir: string,
+    workerQueue: ImageJobQueue,
+    closeAdapter: () => void,
+  ) => Promise<void>,
   overrides: Record<string, string> = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'mcp-integration-'));
@@ -92,19 +100,57 @@ async function withMcp(
     ...overrides,
   });
   const app = await createApp(config, fetchImpl);
+  const workerQueue = new ImageJobQueue(config.dataDir);
+  await workerQueue.init();
+  const worker = new ImageJobWorker({
+    config,
+    client: app.client,
+    assets: app.assets,
+    costs: app.costs,
+    store: app.store,
+    queue: workerQueue,
+    pollIntervalMs: 1,
+    logger: () => undefined,
+  });
+  const workerRun = worker.run();
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await app.server.connect(serverTransport);
   const client = new Client({ name: 'mcp-generation-test', version: '1.0.0' });
   await client.connect(clientTransport);
   try {
-    await test(client, root, dir);
+    await test(client, root, dir, workerQueue, () => {
+      try {
+        app.imageQueue.close();
+      } catch {
+        /* SQLite may still have a statement in flight. */
+      }
+    });
   } finally {
     await client.close();
+    worker.requestStop();
+    await workerRun;
+    workerQueue.close();
+    try {
+      app.imageQueue.close();
+    } catch {
+      /* A cancellation test may close the adapter handle early. */
+    }
   }
 }
 
+async function waitForImageJob(client: Client, jobId: string) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const result = await client.callTool({ name: 'get_image_job_status', arguments: { job_id: jobId } });
+    const job = (result.structuredContent as { job: { status: string } }).job;
+    if (!['queued', 'running'].includes(job.status))
+      return result.structuredContent as { job: Record<string, unknown> };
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Image job ${jobId} did not finish in the test timeout`);
+}
+
 describe('MCP tool integration with mocked OpenRouter responses', () => {
-  it('performs handshake and advertises all ten tools', async () => {
+  it('performs handshake and advertises all 15 tools', async () => {
     await withMcp(
       async () => new Response('{}'),
       async (client) => {
@@ -117,13 +163,76 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
           'generate_image',
           'generate_variations',
           'generate_video',
+          'get_image_job_status',
           'get_video_status',
           'list_assets',
+          'list_image_jobs',
           'list_models',
+          'reconcile_image_job',
+          'start_image_edit_job',
+          'start_image_job',
         ]);
       },
     );
   });
+
+  it.each([75_000, 150_000])(
+    'returns a durable job id before a simulated %d ms upstream response, even if the adapter closes',
+    async (simulatedLatencyMs) => {
+      let releaseResponse!: () => void;
+      let notifyPostStarted!: () => void;
+      const postStarted = new Promise<void>((resolve) => {
+        notifyPostStarted = resolve;
+      });
+      const responseGate = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      const fetchMock: typeof fetch = async (input, init) => {
+        const url = String(input);
+        if (url.endsWith('/images/models')) return Response.json(imageCatalog());
+        if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints'))
+          return Response.json({ endpoints: [{ pricing: [{ unit: 'image', cost_usd: '0.05' }] }] });
+        if (url.endsWith('/images') && init?.method === 'POST') {
+          notifyPostStarted();
+          await responseGate;
+          return Response.json({ data: [{ b64_json: pngData() }], usage: { cost: 0.04 } });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      };
+      await withMcp(fetchMock, async (client, _root, _dir, workerQueue, closeAdapter) => {
+        try {
+          const startedAt = performance.now();
+          const result = await client.callTool({
+            name: 'start_image_job',
+            arguments: { prompt: `simulated delay ${simulatedLatencyMs}`, allow_paid: true },
+          });
+          const elapsedMs = performance.now() - startedAt;
+          expect(result.isError).not.toBe(true);
+          const accepted = result.structuredContent as { job_id: string; status: string };
+          expect(accepted.job_id).toMatch(/^[0-9a-f-]{36}$/);
+          expect(accepted.status).toBe('queued');
+          expect(elapsedMs).toBeLessThan(5_000);
+          const startedOutcome = await Promise.race([
+            postStarted.then(() => 'started'),
+            new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 1_000)),
+          ]);
+          expect(startedOutcome).toBe('started');
+          closeAdapter(); // Simulate Claude cancelling/closing its stdio adapter after job acceptance.
+          releaseResponse();
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            if (workerQueue.get(accepted.job_id)?.status === 'completed') break;
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          const job = workerQueue.get(accepted.job_id);
+          expect(job?.status).toBe('completed');
+          expect(job?.files).toHaveLength(1);
+          expect((await readFile(job!.files[0]!)).length).toBe(24);
+        } finally {
+          releaseResponse();
+        }
+      });
+    },
+  );
 
   it('returns current model capabilities and structured content', async () => {
     const fetchMock: typeof fetch = async (input) => {
@@ -153,6 +262,44 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
     });
   });
 
+  it('shows exact image generation and edit dry-run payloads without base64 and without POSTs', async () => {
+    let posts = 0;
+    const fetchMock: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/images/models')) return Response.json(imageCatalog());
+      if (url.endsWith('/images/models/google/gemini-3.1-flash-lite-image/endpoints'))
+        return Response.json({ endpoints: [{ pricing: [{ unit: 'image', cost_usd: '0.05' }] }] });
+      if (url.endsWith('/images') && init?.method === 'POST') posts += 1;
+      throw new Error(`Unexpected request: ${url}`);
+    };
+    await withMcp(fetchMock, async (client, root) => {
+      const input = join(root, 'reference.png');
+      await writeFile(input, Buffer.from(pngData(), 'base64'));
+      const generated = await client.callTool({
+        name: 'generate_image',
+        arguments: { prompt: 'A blue bird', dry_run: true },
+      });
+      expect(generated.isError).not.toBe(true);
+      expect(generated.structuredContent).toMatchObject({
+        dry_run: true,
+        request: { model: 'google/gemini-3.1-flash-lite-image', prompt: 'A blue bird' },
+      });
+      const edited = await client.callTool({
+        name: 'edit_image',
+        arguments: { prompt: 'Keep the same bird, add clouds', input_image_path: input, dry_run: true },
+      });
+      expect(edited.isError).not.toBe(true);
+      const request = (edited.structuredContent as { request: Record<string, unknown> }).request;
+      expect(request).toMatchObject({
+        model: 'google/gemini-3.1-flash-lite-image',
+        prompt: 'Keep the same bird, add clouds',
+        input_references: [{ type: 'image_url', image_url: { url: '[base64 omitido; data URL image/png]' } }],
+      });
+      expect(JSON.stringify(edited.structuredContent)).not.toContain('base64,');
+    });
+    expect(posts).toBe(0);
+  });
+
   it('generates and stores an image using a mocked response and records actual usage', async () => {
     let sawAuth = false;
     const fetchMock: typeof fetch = async (input, init) => {
@@ -173,21 +320,32 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
       }
       throw new Error(`Unexpected request: ${url}`);
     };
-    await withMcp(fetchMock, async (client, root, dir) => {
+    await withMcp(fetchMock, async (client, root, dir, workerQueue) => {
       const result = await client.callTool({
         name: 'generate_image',
         arguments: { prompt: 'A tiny green dragon', allow_paid: true },
       });
       expect(result.isError).not.toBe(true);
-      const structured = result.structuredContent as {
-        files: Array<{ path: string; mime_type: string }>;
-        usage: { cost_usd: number };
-      };
-      expect(structured.files[0]?.path).toContain(root);
-      expect(structured.files[0]?.mime_type).toBe('image/png');
-      expect(structured.usage.cost_usd).toBe(0.04);
+      const accepted = result.structuredContent as { job_id: string; status: string };
+      expect(accepted.status).toBe('queued');
+      const status = await waitForImageJob(client, accepted.job_id);
+      const structured = status.job as { files: string[]; cost_usd: number; status: string };
+      expect(structured.status).toBe('completed');
+      expect(structured.files[0]).toContain(root);
+      expect(structured.cost_usd).toBe(0.04);
+      const phases = workerQueue.events(accepted.job_id).map((event) => event.phase);
+      expect(phases).toEqual(
+        expect.arrayContaining([
+          'post_started',
+          'http_response_received',
+          'result_parsed',
+          'cost_accounted',
+          'files_persisted',
+          'completed',
+        ]),
+      );
       expect(sawAuth).toBe(true);
-      expect((await readFile(structured.files[0]!.path)).length).toBe(24);
+      expect((await readFile(structured.files[0]!)).length).toBe(24);
       const assets = JSON.parse(await readFile(join(dir, 'data', 'assets.json'), 'utf8')) as unknown[];
       const usage = JSON.parse(await readFile(join(dir, 'data', 'usage.json'), 'utf8')) as Array<{
         costUsd: number;
@@ -224,12 +382,13 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
         arguments: { prompt: 'Move the subject to a forest', input_image_path: input, allow_paid: true },
       });
       expect(edited.isError).not.toBe(true);
-      const editOutput = edited.structuredContent as {
-        files: Array<{ path: string }>;
-        generation_id: string;
+      const editAccepted = edited.structuredContent as { job_id: string };
+      const editOutput = (await waitForImageJob(client, editAccepted.job_id)).job as {
+        files: string[];
+        job_id: string;
       };
       expect(editOutput.files).toHaveLength(1);
-      expect(editOutput.generation_id).toBeTruthy();
+      expect(editOutput.job_id).toBeTruthy();
       expect(sentBodies[0]?.input_references).toEqual([
         { type: 'image_url', image_url: { url: expect.stringContaining('data:image/png;base64,') } },
       ]);
@@ -239,13 +398,14 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
         arguments: { prompt: 'A green dragon mascot', count: 2, allow_paid: true },
       });
       expect(variations.isError).not.toBe(true);
-      const variationOutput = variations.structuredContent as {
-        files: Array<{ path: string }>;
-        generation_id: string;
-        count: number;
+      const variationAccepted = variations.structuredContent as { job_id: string };
+      const variationOutput = (await waitForImageJob(client, variationAccepted.job_id)).job as {
+        files: string[];
+        job_id: string;
+        status: string;
       };
-      expect(variationOutput.count).toBe(2);
-      expect(variationOutput.files.map((file) => file.path)).toEqual(
+      expect(variationOutput.files).toHaveLength(2);
+      expect(variationOutput.files).toEqual(
         expect.arrayContaining([
           expect.stringMatching(/variation-.+-01\.png$/),
           expect.stringMatching(/variation-.+-02\.png$/),
@@ -263,7 +423,7 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
       expect(list.count).toBe(3);
       expect(
         list.assets.some(
-          (asset) => asset.generation_id === editOutput.generation_id && asset.related_asset_path === input,
+          (asset) => asset.generation_id === editOutput.job_id && asset.related_asset_path === input,
         ),
       ).toBe(true);
 
@@ -298,14 +458,16 @@ describe('MCP tool integration with mocked OpenRouter responses', () => {
         arguments: { prompt: 'A green dragon mascot', count: 2, allow_paid: true },
       });
       expect(result.isError).not.toBe(true);
-      const output = result.structuredContent as {
-        count: number;
-        partial_failure?: string;
-        files: Array<{ path: string }>;
+      const accepted = result.structuredContent as { job_id: string };
+      const output = (await waitForImageJob(client, accepted.job_id)).job as {
+        files: string[];
+        status: string;
+        error: string;
       };
-      expect(output.count).toBe(1);
-      expect(output.partial_failure).toContain('429');
-      expect((await readFile(output.files[0]!.path)).length).toBe(24);
+      expect(output.status).toBe('failed');
+      expect(output.error).toContain('429');
+      expect(output.files).toHaveLength(1);
+      expect((await readFile(output.files[0]!)).length).toBe(24);
       const usage = JSON.parse(await readFile(join(dir, 'data', 'usage.json'), 'utf8')) as Array<{
         costUsd: number;
       }>;

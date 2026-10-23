@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as lockfile from 'proper-lockfile';
@@ -57,6 +57,25 @@ interface PaidRequestRecord {
   remoteId?: string;
 }
 
+export interface PaidRequestSummary {
+  id: string;
+  operation: string;
+  createdAt: string;
+  state: 'pending' | 'uncertain';
+  budgetUsd: number;
+  unknownCost: boolean;
+  remoteId?: string;
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const directory = await open(path, 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 export class MetadataStore {
   private queue: Promise<void> = Promise.resolve();
   readonly jobsPath: string;
@@ -92,14 +111,17 @@ export class MetadataStore {
   private async writeArray<T>(path: string, value: T[]): Promise<void> {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     const temp = `${path}.${randomUUID()}.tmp`;
+    let file: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, {
-        encoding: 'utf8',
-        flag: 'wx',
-        mode: 0o600,
-      });
+      file = await open(temp, 'wx', 0o600);
+      await file.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+      await file.sync();
+      await file.close();
+      file = undefined;
       await rename(temp, path);
+      await syncDirectory(dirname(path));
     } catch (error) {
+      await file?.close().catch(() => undefined);
       await rm(temp, { force: true }).catch(() => undefined);
       throw new AppError(`Não foi possível gravar metadados locais: ${path}`, 'METADATA_WRITE_ERROR', {
         cause: error,
@@ -145,6 +167,40 @@ export class MetadataStore {
     return this.readArray<AssetRecord>(this.assetsPath);
   }
 
+  async paidRequests(): Promise<PaidRequestSummary[]> {
+    return this.readArray<PaidRequestRecord>(this.requestsPath);
+  }
+
+  async paidRequest(id: string): Promise<PaidRequestSummary | undefined> {
+    return (await this.paidRequests()).find((request) => request.id === id);
+  }
+
+  async usageForJob(jobId: string): Promise<
+    | {
+        at: string;
+        model: string;
+        costUsd: number | null;
+        budgetUsd: number;
+        unknownCost: boolean;
+        operation: string;
+      }
+    | undefined
+  > {
+    const items = await this.readArray<{
+      at: string;
+      model: string;
+      costUsd: number | null;
+      budgetUsd: number;
+      unknownCost: boolean;
+      operation: string;
+      jobId?: string;
+    }>(this.usagePath);
+    const found = items.find((item) => item.jobId === jobId);
+    if (!found) return undefined;
+    const { at, model, costUsd, budgetUsd, unknownCost, operation } = found;
+    return { at, model, costUsd, budgetUsd, unknownCost, operation };
+  }
+
   async saveJob(job: VideoJobRecord): Promise<void> {
     await this.serial(async () => {
       const items = await this.jobs();
@@ -162,7 +218,14 @@ export class MetadataStore {
   async saveAsset(asset: AssetRecord): Promise<void> {
     await this.serial(async () => {
       const items = await this.assets();
-      items.push(asset);
+      const index = asset.jobId
+        ? items.findIndex(
+            (item) =>
+              item.jobId === asset.jobId && item.parameters?.output_index === asset.parameters?.output_index,
+          )
+        : -1;
+      if (index >= 0) items[index] = asset;
+      else items.push(asset);
       await this.writeArray(this.assetsPath, items);
     });
   }
@@ -200,6 +263,14 @@ export class MetadataStore {
         this.usagePath,
       );
       const requests = await this.readArray<PaidRequestRecord>(this.requestsPath);
+      const sameId = requests.find((request) => request.id === args.id);
+      if (sameId) {
+        if (sameId.fingerprint === args.fingerprint && sameId.state === 'pending') return;
+        throw new AppError(
+          'O identificador local já está associado a uma reserva diferente ou incerta.',
+          'PAID_REQUEST_ID_CONFLICT',
+        );
+      }
       if (
         requests.some(
           (request) =>
@@ -263,7 +334,7 @@ export class MetadataStore {
     entry: {
       at: string;
       model: string;
-      costUsd: number;
+      costUsd: number | null;
       budgetUsd: number;
       unknownCost: boolean;
       operation: string;
@@ -292,28 +363,6 @@ export class MetadataStore {
     args: { model: string; estimateUsd: number | null; operation: string; remoteId?: string },
   ): Promise<void> {
     await this.serial(async () => {
-      const usage = await this.readArray<{
-        at: string;
-        model: string;
-        costUsd: number;
-        budgetUsd: number;
-        unknownCost: boolean;
-        operation: string;
-        requestId?: string;
-      }>(this.usagePath);
-      const value = {
-        at: new Date().toISOString(),
-        model: args.model,
-        costUsd: 0,
-        budgetUsd: args.estimateUsd ?? 0,
-        unknownCost: true,
-        operation: args.operation,
-        requestId: id,
-      };
-      const index = usage.findIndex((item) => item.requestId === id);
-      if (index >= 0) usage[index] = value;
-      else usage.push(value);
-      await this.writeArray(this.usagePath, usage);
       const requests = await this.readArray<PaidRequestRecord>(this.requestsPath);
       const found = requests.find((item) => item.id === id);
       if (found) {
@@ -321,6 +370,11 @@ export class MetadataStore {
         found.unknownCost = true;
         if (args.remoteId) found.remoteId = args.remoteId;
         await this.writeArray(this.requestsPath, requests);
+      } else {
+        throw new AppError(
+          `A reserva local ${id} não existe; não é seguro classificar o pedido como incerto.`,
+          'PAID_REQUEST_NOT_FOUND',
+        );
       }
     });
   }

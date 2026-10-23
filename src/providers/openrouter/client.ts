@@ -59,7 +59,12 @@ export class OpenRouterClient {
     return parsed.data;
   }
 
-  private async requestJson<T>(path: string, init: RequestInit = {}, requireApiKey = true): Promise<T> {
+  private async requestJson<T>(
+    path: string,
+    init: RequestInit = {},
+    requireApiKey = true,
+    onResponse?: (response: Response) => void,
+  ): Promise<T> {
     let response: Response;
     try {
       response = await this.fetchImpl(this.url(path), {
@@ -78,6 +83,7 @@ export class OpenRouterClient {
         },
       );
     }
+    onResponse?.(response);
     if (!response.ok) {
       let detail: string;
       try {
@@ -168,10 +174,27 @@ export class OpenRouterClient {
   }
 
   generateImage(body: OpenRouterImageRequest): Promise<ImageGenerationResponse> {
-    return this.requestJson<unknown>('/images', { method: 'POST', body: JSON.stringify(body) }).then(
-      (value) =>
-        this.parseResponse(imageGenerationResponseSchema, value, 'imagem') as ImageGenerationResponse,
+    return this.generateImageWithStatus(body).then((result) => result.response);
+  }
+
+  async generateImageWithStatus(
+    body: OpenRouterImageRequest,
+    onHttpResponse?: (status: number) => void,
+  ): Promise<{ response: ImageGenerationResponse; status: number }> {
+    let status = 0;
+    const value = await this.requestJson<unknown>(
+      '/images',
+      { method: 'POST', body: JSON.stringify(body) },
+      true,
+      (response) => {
+        status = response.status;
+        onHttpResponse?.(response.status);
+      },
     );
+    return {
+      response: this.parseResponse(imageGenerationResponseSchema, value, 'imagem') as ImageGenerationResponse,
+      status,
+    };
   }
 
   createVideo(body: OpenRouterVideoRequest): Promise<VideoJobResponse> {

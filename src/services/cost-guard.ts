@@ -171,7 +171,22 @@ export class CostGuard {
     args: { allowPaid: boolean; maxCostUsd?: number },
     operation: string,
     fingerprint: string,
+    requestId: string = randomUUID(),
   ): Promise<string> {
+    this.validate(estimate, args);
+    await this.store.reservePaidRequest({
+      id: requestId,
+      operation,
+      fingerprint,
+      budgetUsd: estimate.estimateUsd ?? 0,
+      unknownCost: estimate.estimateUsd === null,
+      maxTotalSpendUsd: this.config.maxTotalSpendUsd,
+      allowUnknownCost: this.config.allowUnknownCost,
+    });
+    return requestId;
+  }
+
+  validate(estimate: CostEstimate, args: { allowPaid: boolean; maxCostUsd?: number }): void {
     if (!args.allowPaid)
       throw new AppError(
         'Operação paga bloqueada. Defina allow_paid: true para autorizar esta geração.',
@@ -197,16 +212,5 @@ export class CostGuard {
         'REQUEST_COST_LIMIT',
       );
     }
-    const id = randomUUID();
-    await this.store.reservePaidRequest({
-      id,
-      operation,
-      fingerprint,
-      budgetUsd: estimate.estimateUsd ?? 0,
-      unknownCost: estimate.estimateUsd === null,
-      maxTotalSpendUsd: this.config.maxTotalSpendUsd,
-      allowUnknownCost: this.config.allowUnknownCost,
-    });
-    return id;
   }
 }

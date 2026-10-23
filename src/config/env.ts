@@ -10,8 +10,16 @@ export function resolveServerRoot(moduleUrl: string): string {
 
 const serverRoot = resolveServerRoot(import.meta.url);
 
-export function loadServerEnvironment(root = serverRoot): void {
+export function loadServerEnvironment(
+  root = serverRoot,
+  externalEnvPath = join(homedir(), '.config', 'mcp-generation', 'worker.env'),
+): void {
+  const inherited = { ...process.env };
+  loadDotEnv({ path: externalEnvPath, quiet: true });
   loadDotEnv({ path: join(root, '.env'), quiet: true });
+  for (const [key, value] of Object.entries(inherited)) {
+    if (value !== undefined) process.env[key] = value;
+  }
 }
 
 loadServerEnvironment();

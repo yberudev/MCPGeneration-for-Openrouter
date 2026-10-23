@@ -1,18 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import {
-  access,
-  link,
-  lstat,
-  mkdir,
-  open,
-  readFile,
-  realpath,
-  rm,
-  stat,
-  unlink,
-  writeFile,
-} from 'node:fs/promises';
+import { access, link, lstat, mkdir, open, readFile, realpath, rm, stat, unlink } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { VIDEO_MIME_EXTENSIONS } from '../config/defaults.js';
 import type { AppConfig } from '../config/env.js';
@@ -275,6 +263,7 @@ export class AssetManager {
     relatedAssetId?: string;
     relatedAssetPath?: string;
     generationId?: string;
+    jobId?: string;
   }): Promise<SavedAsset> {
     if (args.bytes.length > this.config.maxImageBytes)
       throw new AppError('A imagem devolvida excede o limite configurado.', 'IMAGE_TOO_LARGE');
@@ -285,11 +274,71 @@ export class AssetManager {
       `image-${new Date().toISOString().replace(/[:.]/g, '-')}`,
       info.extension,
     );
-    const destination = await this.availablePath(directory, name);
+    const outputIndex = args.parameters?.output_index;
+    const prior = args.jobId
+      ? (await this.store.assets()).find(
+          (asset) => asset.jobId === args.jobId && asset.parameters?.output_index === outputIndex,
+        )
+      : undefined;
+    if (prior) {
+      try {
+        const existing = await readFile(prior.path);
+        if (existing.equals(args.bytes)) return { ...prior, absolutePath: prior.path };
+      } catch {
+        /* A missing or corrupt asset is recreated from the durable worker output below. */
+      }
+    }
+    const destination = args.jobId ? join(directory, name) : await this.availablePath(directory, name);
     const temp = join(directory, `.${randomUUID()}.tmp`);
+    let alreadyWritten = false;
     try {
-      await writeFile(temp, args.bytes, { flag: 'wx', mode: 0o600 });
-      const finalPath = await this.finalize(temp, directory, basename(destination));
+      if (args.jobId) {
+        try {
+          const existing = await readFile(destination);
+          if (!existing.equals(args.bytes))
+            throw new AppError(
+              'O nome idempotente do job já contém outros dados.',
+              'IMAGE_JOB_FILE_CONFLICT',
+            );
+          alreadyWritten = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+      let finalPath: string;
+      if (alreadyWritten) finalPath = destination;
+      else {
+        const file = await open(temp, 'wx', 0o600);
+        try {
+          await file.writeFile(args.bytes);
+          await file.sync();
+        } finally {
+          await file.close();
+        }
+        if (args.jobId) {
+          try {
+            await link(temp, destination);
+            await unlink(temp);
+            const directoryHandle = await open(directory, 'r');
+            try {
+              await directoryHandle.sync();
+            } finally {
+              await directoryHandle.close();
+            }
+            finalPath = destination;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+            const existing = await readFile(destination);
+            if (!existing.equals(args.bytes))
+              throw new AppError(
+                'O nome idempotente do job já contém outros dados.',
+                'IMAGE_JOB_FILE_CONFLICT',
+              );
+            await unlink(temp).catch(() => undefined);
+            finalPath = destination;
+          }
+        } else finalPath = await this.finalize(temp, directory, basename(destination));
+      }
       const asset: AssetRecord = {
         id: randomUUID(),
         type: 'image',
@@ -306,6 +355,7 @@ export class AssetManager {
         createdAt: new Date().toISOString(),
         costUsd: args.costUsd,
         ...(args.generationId ? { generationId: args.generationId } : {}),
+        ...(args.jobId ? { jobId: args.jobId } : {}),
         ...(args.relatedAssetId ? { relatedAssetId: args.relatedAssetId } : {}),
         ...(args.relatedAssetPath ? { relatedAssetPath: args.relatedAssetPath } : {}),
         ...(args.parameters ? { parameters: args.parameters } : {}),
