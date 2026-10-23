@@ -69,6 +69,16 @@ Uninstall removes only the systemd unit. It deliberately leaves SQLite, legacy J
 
 Use `list_image_jobs` for queued/running/failed/completed/uncertain jobs and legacy reservations; use `get_image_job_status` for a single job's phase, cost, errors, audit events and file paths. A job that stays queued is not a reason to create another job: check `systemctl --user status` and the worker logs first.
 
+For free network diagnosis, run `npm run build && npm run diagnose:network`. It performs only an authenticated `GET /api/v1/key` and a deliberately invalid, unauthenticated `POST /api/v1/chat/completions` with `{}`. No valid generation payload is sent. It prints HTTP status, duration, safe transport phase/codes, Node and bundled Undici versions; it omits keys and response bodies. HTTP 400/401 for the invalid POST is expected and proves the API host responded.
+
+The worker's `job_error` logs now carry `network_phase`, `network_layer`, `network_outcome`, `network_timed_out`, `timeout_kind`, `error_codes`, `error_names` and request duration when available. Only allowlisted error codes/names are included; exception messages, headers, prompts and image data are excluded. Failures before response headers can identify DNS, TCP connection and TLS by their system error codes. A reset during the fetch call is reported as TCP at the transport layer and request/send-or-wait-for-headers at the phase layer because Fetch cannot reliably tell whether the socket reset occurred while sending or awaiting headers. A reset while reading the body is attributed to `response_body`.
+
+The client uses manual redirect handling and blocks every 3xx without following `Location`. It records the HTTP status and never forwards the bearer key to another host. The prior `redirect: 'error'` mode could surface as an undifferentiated `TypeError: fetch failed`, which the former worker reduced to `NETWORK_ERROR`.
+
+For job `dabf507f-44c6-4ab2-949f-52e15944606e`, the preserved record remains uncertain with no HTTP status, unknown delivery, null actual cost and a $0.041 estimate. The old journal entry says 641 ms but has no cause code. The HTTP client had wrapped the original cause; the worker discarded it when it persisted a generic message. The historical cause cannot be inferred from the current record. A later free diagnostic received GET 200 and invalid POST 400, confirming key acceptance/connectivity at that later time only.
+
+The installed user service uses Node v24.22.0 and its unit declares `NODE_ENV=production`, with no proxy variables. Node's built-in `fetch` is powered by Undici. Node v24 proxy support depends on environment proxy settings being present and enabled when the process starts; loading values from `worker.env` after startup does not reconfigure the global dispatcher. Do not disable TLS certificate verification to work around a TLS error.
+
 The MCP process returns `job_id` before the image response, so the Claude client's observed ~60-second tool-call cancellation is no longer the image-generation lifetime. The installed Claude Desktop configuration had no explicit MCP timeout value, so that observation is a client/runtime behavior rather than a configured server timeout. Distinguish:
 
 - **MCP call cancellation:** only the short enqueue/status call ends; the worker continues.

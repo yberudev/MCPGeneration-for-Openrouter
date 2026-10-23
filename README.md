@@ -75,6 +75,8 @@ scripts/worker/install-systemd-user.sh
 scripts/worker/verify.sh
 ```
 
+Para testar gratuitamente a conectividade e a chave sem gerar conteúdo, execute `npm run diagnose:network`. Faz um GET autenticado à chave e um POST inválido sem autenticação; nunca envia um pedido válido de geração.
+
 `prepare-env.sh` move a variável de `.env` para o ficheiro externo, quando necessário, preserva uma cópia com permissões restritas e nunca mostra o valor. Se não existir uma chave local, crie `~/.config/mcp-generation/worker.env` com `OPENROUTER_API_KEY=<a sua chave>` e modo `0600`. Consulte [operação e recuperação do worker](docs/image-jobs-linux.md).
 
 Inicie o servidor localmente com `npm start`. Num terminal, o processo fica à espera de um cliente MCP; a saída padrão é reservada ao protocolo.

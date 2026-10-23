@@ -21,3 +21,24 @@
 | Claude mostra ligação falhada           | Confirme o caminho absoluto em `claude mcp get`, `OPENROUTER_API_KEY` no ambiente pai, e use `/mcp` para verificar aprovação de um servidor de projeto.           |
 
 Os erros HTTP 400, 401, 402, 403, 404, 429 e 5xx são traduzidos para mensagens curtas. O servidor não repete POSTs de geração automaticamente.
+
+## Diagnóstico de rede do OpenRouter
+
+Depois de compilar, execute `npm run diagnose:network`. O comando faz apenas `GET /api/v1/key` com a chave atual e `POST /api/v1/chat/completions` com `{}` e sem autenticação. O segundo pedido é inválido e não contém um modelo ou mensagens para geração. O comando nunca imprime cabeçalhos, chave, corpos de resposta ou detalhes da conta. Um `GET 200` confirma que a chave foi aceite; qualquer status HTTP no POST inválido confirma que o host respondeu. O status esperado do POST pode ser 400 ou 401.
+
+O cliente HTTP usa `fetch` do Node 24, implementado sobre Undici. Em `NETWORK_ERROR`, o cliente preserva a cadeia `cause`; o worker regista apenas códigos de erro permitidos, camada de transporte e fase identificável: DNS, TCP, TLS, envio/espera dos cabeçalhos ou leitura do corpo. Regista também duração e indica timeout. A camada `fetch` não consegue provar se um reset anterior aos cabeçalhos aconteceu durante o envio ou enquanto aguardava resposta, por isso essa fase aparece combinada. Mensagens textuais da exceção nunca são registadas.
+
+Redirecionamentos são detetados com `redirect: 'manual'` e bloqueados explicitamente. O cliente não segue `Location`, não envia a chave a outro host e mantém o pedido pago em estado incerto quando recebeu um 3xx. O `redirect: 'error'` anterior podia rejeitar o redirect dentro de `fetch` como um erro genérico sem status HTTP.
+
+No incidente `dabf507f-44c6-4ab2-949f-52e15944606e`, o log disponível indicava falha em 641 ms, `post_started` e nenhum status HTTP. A versão anterior guardou o `cause` no `AppError`, mas o worker descartava-o ao criar a mensagem segura. O histórico não contém informação suficiente para determinar se foi reset TCP, DNS, TLS ou redirect; nenhum diagnóstico posterior pode reconstruir essa causa. A verificação gratuita posterior obteve GET 200 e POST inválido 400, o que confirma que a chave e a conectividade funcionavam nessa verificação, não durante o incidente.
+
+O unit `systemd --user` atual executa Node v24.22.0, tem apenas `NODE_ENV=production` no ambiente do unit e não declara proxy. Node 24 usa Undici para `fetch`; o suporte a `HTTP_PROXY`/`HTTPS_PROXY` requer configuração reconhecida no arranque do Node, incluindo `NODE_USE_ENV_PROXY=1`. Um `.env` carregado depois do arranque não ativa por si só o dispatcher de proxy. Não desative a validação TLS (`NODE_TLS_REJECT_UNAUTHORIZED=0`) para contornar erros de certificado.
+
+```bash
+cd /home/yberudev/Documentos/MCPGeneration
+npm run build
+npm run diagnose:network
+journalctl --user -u mcp-generation-image-worker.service -n 100 --no-pager -o cat
+```
+
+Se um POST de imagem falhar sem resposta conclusiva, o estado permanece `uncertain`, a reserva mantém-se e não existe retry automático. Só reconcilie depois de confirmar a atividade e o custo na conta OpenRouter.

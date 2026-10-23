@@ -1,4 +1,11 @@
+import { performance } from 'node:perf_hooks';
 import { AppError } from '../../utils/errors.js';
+import {
+  getTransportDiagnostic,
+  OpenRouterTransportError,
+  transportDiagnostic,
+  type TransportDiagnostic,
+} from './diagnostics.js';
 import { apiError } from './errors.js';
 import {
   imageGenerationResponseSchema,
@@ -23,6 +30,15 @@ interface OpenRouterClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+export interface NetworkProbeResult {
+  name: 'authenticated_key_get' | 'unauthenticated_invalid_post';
+  http_status: number | null;
+  duration_ms: number;
+  http_reachable: boolean;
+  error_code?: string;
+  transport?: TransportDiagnostic;
+}
+
 export class OpenRouterClient {
   private readonly fetchImpl: typeof fetch;
   private readonly maxResponseBytes: number;
@@ -36,12 +52,30 @@ export class OpenRouterClient {
     return `${this.options.baseUrl.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
   }
 
-  private headers(json = false, requireApiKey = true): HeadersInit {
+  private safeUrl(path: string): URL {
+    const base = new URL(this.options.baseUrl);
+    const target = new URL(this.url(path));
+    if (
+      target.protocol !== 'https:' ||
+      target.hostname !== 'openrouter.ai' ||
+      target.origin !== base.origin ||
+      target.username ||
+      target.password
+    ) {
+      throw new AppError(
+        'Pedido bloqueado: a chave só pode ser enviada ao host oficial do OpenRouter por HTTPS.',
+        'UNSAFE_API_DESTINATION',
+      );
+    }
+    return target;
+  }
+
+  private headers(json = false, requireApiKey = true, sendApiKey = true): HeadersInit {
     if (requireApiKey && !this.options.apiKey) {
       throw new AppError('Define OPENROUTER_API_KEY no ambiente do servidor.', 'MISSING_API_KEY');
     }
     return {
-      ...(this.options.apiKey ? { Authorization: `Bearer ${this.options.apiKey}` } : {}),
+      ...(sendApiKey && this.options.apiKey ? { Authorization: `Bearer ${this.options.apiKey}` } : {}),
       ...(json ? { 'Content-Type': 'application/json' } : {}),
     };
   }
@@ -63,33 +97,60 @@ export class OpenRouterClient {
     path: string,
     init: RequestInit = {},
     requireApiKey = true,
-    onResponse?: (response: Response) => void,
+    onResponse?: (response: Response, requestDurationMs: number) => void,
+    sendApiKey = true,
   ): Promise<T> {
+    const requestStarted = performance.now();
+    const signal = init.signal ?? AbortSignal.timeout(this.options.timeoutMs);
     let response: Response;
     try {
-      response = await this.fetchImpl(this.url(path), {
+      response = await this.fetchImpl(this.safeUrl(path), {
         ...init,
-        headers: { ...this.headers(init.body !== undefined, requireApiKey), ...init.headers },
-        redirect: 'error',
-        signal: init.signal ?? AbortSignal.timeout(this.options.timeoutMs),
+        headers: { ...this.headers(init.body !== undefined, requireApiKey, sendApiKey), ...init.headers },
+        // Do not follow redirects: even same-origin redirects are unnecessary for
+        // these fixed API routes, and a redirect can never receive the bearer key.
+        redirect: 'manual',
+        signal,
       });
     } catch (error) {
       if (error instanceof AppError) throw error;
-      throw new AppError(
+      throw new OpenRouterTransportError(
         'Falha de rede ou timeout ao contactar o OpenRouter. O pedido não foi repetido.',
         'NETWORK_ERROR',
+        error,
+        transportDiagnostic(error, 'request_or_waiting_for_headers', performance.now() - requestStarted, signal),
+      );
+    }
+    const requestDurationMs = Math.round(performance.now() - requestStarted);
+    onResponse?.(response, requestDurationMs);
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenRouterTransportError(
+        `O OpenRouter respondeu com redirecionamento HTTP ${response.status}; o pedido foi bloqueado sem reenviar credenciais.`,
+        'REDIRECT_BLOCKED',
+        undefined,
         {
-          cause: error,
+          phase: 'redirect',
+          transport_layer: 'http',
+          outcome: 'redirect_blocked',
+          duration_ms: requestDurationMs,
+          timed_out: false,
+          error_codes: [],
+          error_names: [],
         },
       );
     }
-    onResponse?.(response);
     if (!response.ok) {
       let detail: string;
       try {
         detail = await this.readTextLimited(response, 16_384);
-      } catch {
-        detail = 'Não foi possível ler o corpo de erro.';
+      } catch (error) {
+        throw new OpenRouterTransportError(
+          `OpenRouter respondeu HTTP ${response.status}, mas o corpo de erro não pôde ser lido.`,
+          `OPENROUTER_HTTP_${response.status}`,
+          error,
+          transportDiagnostic(error, 'response_body', performance.now() - requestStarted, signal, 'response_read_error'),
+        );
       }
       if (this.options.apiKey) detail = detail.replaceAll(this.options.apiKey, '[redacted]');
       throw apiError(response.status, detail);
@@ -108,7 +169,17 @@ export class OpenRouterClient {
       const chunks: Buffer[] = [];
       let total = 0;
       while (true) {
-        const chunk = await reader.read();
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (error) {
+          throw new OpenRouterTransportError(
+            'A ligação falhou durante a leitura da resposta do OpenRouter.',
+            'RESPONSE_READ_ERROR',
+            error,
+            transportDiagnostic(error, 'response_body', performance.now() - requestStarted, signal, 'response_read_error'),
+          );
+        }
         if (chunk.done) break;
         total += chunk.value.byteLength;
         if (total > this.maxResponseBytes) {
@@ -120,10 +191,24 @@ export class OpenRouterClient {
         }
         chunks.push(Buffer.from(chunk.value));
       }
-      return JSON.parse(Buffer.concat(chunks, total).toString('utf8')) as T;
+      try {
+        return JSON.parse(Buffer.concat(chunks, total).toString('utf8')) as T;
+      } catch (error) {
+        throw new OpenRouterTransportError(
+          'O OpenRouter devolveu um corpo que não é JSON válido.',
+          'INVALID_RESPONSE',
+          error,
+          transportDiagnostic(error, 'response_parse', performance.now() - requestStarted, signal, 'invalid_json'),
+        );
+      }
     } catch (error) {
       if (error instanceof AppError) throw error;
-      throw new AppError('O OpenRouter devolveu JSON inválido.', 'INVALID_RESPONSE', { cause: error });
+      throw new OpenRouterTransportError(
+        'Falha ao ler a resposta do OpenRouter.',
+        'RESPONSE_READ_ERROR',
+        error,
+        transportDiagnostic(error, 'response_body', performance.now() - requestStarted, signal, 'response_read_error'),
+      );
     }
   }
 
@@ -179,16 +264,16 @@ export class OpenRouterClient {
 
   async generateImageWithStatus(
     body: OpenRouterImageRequest,
-    onHttpResponse?: (status: number) => void,
+    onHttpResponse?: (status: number, requestDurationMs: number) => void,
   ): Promise<{ response: ImageGenerationResponse; status: number }> {
     let status = 0;
     const value = await this.requestJson<unknown>(
       '/images',
       { method: 'POST', body: JSON.stringify(body) },
       true,
-      (response) => {
+      (response, requestDurationMs) => {
         status = response.status;
-        onHttpResponse?.(response.status);
+        onHttpResponse?.(response.status, requestDurationMs);
       },
     );
     return {
@@ -209,23 +294,97 @@ export class OpenRouterClient {
     );
   }
 
+  private async probe(
+    name: NetworkProbeResult['name'],
+    path: string,
+    init: RequestInit,
+    requireApiKey: boolean,
+    sendApiKey: boolean,
+  ): Promise<NetworkProbeResult> {
+    const started = performance.now();
+    let httpStatus: number | null = null;
+    let requestDurationMs = 0;
+    try {
+      await this.requestJson<unknown>(
+        path,
+        init,
+        requireApiKey,
+        (response, durationMs) => {
+          httpStatus = response.status;
+          requestDurationMs = durationMs;
+        },
+        sendApiKey,
+      );
+      return {
+        name,
+        http_status: httpStatus,
+        duration_ms: requestDurationMs,
+        http_reachable: httpStatus !== null,
+      };
+    } catch (error) {
+      const diagnostic =
+        error instanceof AppError && /^OPENROUTER_HTTP_\d{3}$/.test(error.code)
+          ? Number(error.code.slice(-3))
+          : null;
+      const transport = getTransportDiagnostic(error);
+      return {
+        name,
+        http_status: httpStatus ?? diagnostic,
+        duration_ms: transport?.duration_ms ?? (requestDurationMs || Math.round(performance.now() - started)),
+        http_reachable: httpStatus !== null || diagnostic !== null,
+        ...(error instanceof AppError ? { error_code: error.code } : { error_code: 'NETWORK_ERROR' }),
+        ...(transport ? { transport } : {}),
+      };
+    }
+  }
+
+  async diagnoseNetwork(): Promise<NetworkProbeResult[]> {
+    const key = await this.probe('authenticated_key_get', '/key', { method: 'GET' }, true, true);
+    const unauthenticatedPost = await this.probe(
+      'unauthenticated_invalid_post',
+      '/chat/completions',
+      { method: 'POST', body: '{}' },
+      false,
+      false,
+    );
+    return [key, unauthenticatedPost];
+  }
+
   async downloadVideo(jobId: string, index: number): Promise<Response> {
+    const requestStarted = performance.now();
+    const signal = AbortSignal.timeout(this.options.timeoutMs);
     let response: Response;
     try {
       response = await this.fetchImpl(
-        this.url(`/videos/${encodeURIComponent(jobId)}/content?index=${index}`),
+        this.safeUrl(`/videos/${encodeURIComponent(jobId)}/content?index=${index}`),
         {
           headers: this.headers(),
-          redirect: 'error',
-          signal: AbortSignal.timeout(this.options.timeoutMs),
+          redirect: 'manual',
+          signal,
         },
       );
     } catch (error) {
-      throw new AppError(
+      throw new OpenRouterTransportError(
         'Falha de rede ou timeout ao descarregar o vídeo. Tente novamente sem criar uma nova geração.',
         'DOWNLOAD_NETWORK_ERROR',
+        error,
+        transportDiagnostic(error, 'request_or_waiting_for_headers', performance.now() - requestStarted, signal),
+      );
+    }
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenRouterTransportError(
+        `O OpenRouter respondeu com redirecionamento HTTP ${response.status}; o pedido foi bloqueado sem reenviar credenciais.`,
+        'REDIRECT_BLOCKED',
+        undefined,
         {
-          cause: error,
+          phase: 'redirect',
+          transport_layer: 'http',
+          outcome: 'redirect_blocked',
+          duration_ms: Math.round(performance.now() - requestStarted),
+          timed_out: false,
+          error_codes: [],
+          error_names: [],
         },
       );
     }

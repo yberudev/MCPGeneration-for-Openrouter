@@ -4,6 +4,7 @@ import { performance } from 'node:perf_hooks';
 import * as lockfile from 'proper-lockfile';
 import type { AppConfig } from '../config/env.js';
 import type { OpenRouterClient } from '../providers/openrouter/client.js';
+import { getTransportDiagnostic } from '../providers/openrouter/diagnostics.js';
 import { AppError, sanitizeErrorMessage } from '../utils/errors.js';
 import { AssetManager, detectImage } from './asset-manager.js';
 import { CostGuard, type CostEstimate } from './cost-guard.js';
@@ -34,11 +35,35 @@ function httpErrorIsDefinitive(status: number | null): boolean {
 }
 
 function technicalError(error: unknown, status: number | null): string {
-  if (status !== null) return `OpenRouter respondeu HTTP ${status}.`;
+  const diagnostic = getTransportDiagnostic(error);
+  if (diagnostic?.outcome === 'redirect_blocked')
+    return `Redirecionamento HTTP bloqueado (${status ?? 'sem status'}); credenciais não foram reenviadas.`;
+  if (status !== null && status >= 400 && status < 500) {
+    if (!diagnostic) return `OpenRouter respondeu HTTP ${status}.`;
+    const codes = diagnostic.error_codes.length ? ` (${diagnostic.error_codes.join(', ')})` : '';
+    return `OpenRouter respondeu HTTP ${status}; falha ao ler os detalhes${codes} após ${diagnostic.duration_ms} ms.`;
+  }
+  if (status !== null && !diagnostic) return `OpenRouter respondeu HTTP ${status}.`;
   const code = error instanceof AppError ? error.code : 'WORKER_ERROR';
+  if (diagnostic) {
+    const phases: Record<string, string> = {
+      dns: 'resolução DNS',
+      tcp_connect: 'ligação TCP',
+      tls_handshake: 'negociação TLS',
+      request_or_waiting_for_headers: 'envio ou espera dos cabeçalhos HTTP',
+      response_body: 'leitura do corpo HTTP',
+      response_parse: 'interpretação da resposta HTTP',
+      redirect: 'redirecionamento HTTP',
+    };
+    const codes = diagnostic.error_codes.length ? ` (${diagnostic.error_codes.join(', ')})` : '';
+    const outcome = diagnostic.timed_out ? 'timeout na' : 'falha na';
+    const responseStatusText = status === null ? '' : `HTTP ${status}; `;
+    return `${responseStatusText}${outcome} ${phases[diagnostic.phase]}${codes} após ${diagnostic.duration_ms} ms; POST incerto, sem retry automático.`;
+  }
   const messages: Record<string, string> = {
     NETWORK_ERROR: 'Falha de rede ou timeout; o resultado do POST pode ser incerto.',
     INVALID_RESPONSE: 'Resposta do OpenRouter inválida; não houve retry.',
+    RESPONSE_READ_ERROR: 'A leitura da resposta falhou; não houve retry.',
     RESPONSE_TOO_LARGE: 'Resposta do OpenRouter excedeu o limite local; não houve retry.',
     IMAGE_POST_UNCERTAIN: 'O estado do POST é incerto e não será repetido.',
     IMAGE_OUTPUT_COUNT_MISMATCH: 'O número de imagens devolvidas foi inferior ao esperado.',
@@ -147,6 +172,7 @@ export class ImageJobWorker {
       const status = this.deps.queue.httpStatus(job.id) ?? responseStatus(error);
       const code = error instanceof AppError ? error.code : 'WORKER_ERROR';
       const message = technicalError(error, status);
+      const network = getTransportDiagnostic(error);
       if (current?.phase === 'post_started') {
         if (httpErrorIsDefinitive(status)) {
           await this.deps.store.releasePaidRequest(job.requestId).catch(() => undefined);
@@ -182,6 +208,18 @@ export class ImageJobWorker {
         http_status: status,
         error_code: code,
         error: message,
+        ...(network
+          ? {
+              request_duration_ms: network.duration_ms,
+              network_phase: network.phase,
+              network_layer: network.transport_layer,
+              network_outcome: network.outcome,
+              network_timed_out: network.timed_out,
+              ...(network.timeout_kind ? { timeout_kind: network.timeout_kind } : {}),
+              error_codes: network.error_codes,
+              error_names: network.error_names,
+            }
+          : {}),
       });
     }
     return true;
@@ -238,13 +276,21 @@ export class ImageJobWorker {
       if (callState === 'post_started')
         throw new AppError('O estado do POST é incerto; o worker não o vai repetir.', 'IMAGE_POST_UNCERTAIN');
       this.deps.queue.markCallPostStarted(job.id, callIndex);
+      this.log({
+        event: 'http_request_started',
+        job_id: job.id,
+        request_id: job.requestId,
+        model: job.model,
+        call_index: callIndex,
+        timeout_ms: this.deps.config.httpTimeoutMs,
+      });
       let response;
       let httpStatus: number;
       let receivedHttpStatus: number | null = null;
       try {
         const result = await this.deps.client.generateImageWithStatus(
           job.payload.requestBodies[callIndex]!,
-          (status) => {
+          (status, requestDurationMs) => {
             receivedHttpStatus = status;
             this.deps.queue.recordHttpStatus(job.id, status);
             this.log({
@@ -253,6 +299,8 @@ export class ImageJobWorker {
               request_id: job.requestId,
               model: job.model,
               http_status: status,
+              request_duration_ms: requestDurationMs,
+              phase: 'response_headers',
               call_index: callIndex,
             });
           },

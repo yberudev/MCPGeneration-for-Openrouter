@@ -350,6 +350,40 @@ describe('durable image jobs and worker recovery', () => {
     }
   });
 
+  it('stores safe transport diagnostics while preserving an uncertain reservation without retry', async () => {
+    let posts = 0;
+    const socketError = Object.assign(new Error('do not log this prompt or secret'), { code: 'ECONNRESET' });
+    const f = await fixture(async (_input, init) => {
+      if (init?.method === 'POST') {
+        posts += 1;
+        throw new TypeError('fetch failed', { cause: socketError });
+      }
+      return imageResponse();
+    });
+    try {
+      await f.worker.runOne();
+      const job = f.workerQueue.get(f.jobId);
+      expect(job?.status).toBe('uncertain');
+      expect(job?.httpStatus).toBeNull();
+      expect(job?.errorMessage).toContain('ECONNRESET');
+      expect((await f.store.paidRequest(f.jobId))?.state).toBe('uncertain');
+      const errorLog = f.logs.find((entry) => entry.event === 'job_error');
+      expect(errorLog).toMatchObject({
+        network_phase: 'request_or_waiting_for_headers',
+        network_outcome: 'network_error',
+        network_timed_out: false,
+        error_codes: ['ECONNRESET'],
+      });
+      expect(errorLog?.request_duration_ms).toEqual(expect.any(Number));
+      expect(JSON.stringify(f.logs)).not.toContain('do not log this prompt or secret');
+      expect(JSON.stringify(f.logs)).not.toContain('test-secret-never-log');
+      expect(await f.worker.runOne()).toBe(false);
+      expect(posts).toBe(1);
+    } finally {
+      await f.close();
+    }
+  });
+
   it('does not report completed when local persistence fails after a paid response', async () => {
     const f = await fixture(async () => imageResponse(0.04));
     try {
